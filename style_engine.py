@@ -279,3 +279,4 @@ def analyze_references(files):
             for field in fields
         }
     )
+    
