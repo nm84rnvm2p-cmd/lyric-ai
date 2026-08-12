@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import io
 import re
 import tempfile
 from pathlib import Path
@@ -16,7 +15,7 @@ from style_engine import StyleDNA, analyze_references
 # ============================================================
 
 st.set_page_config(
-    page_title="Lyric AI — Definitive",
+    page_title="Lyric AI",
     page_icon="🎵",
     layout="centered",
 )
@@ -45,7 +44,7 @@ def save_upload(uploaded_file, directory, name=None):
 
 
 # ============================================================
-# WHISPER — TRANSCRIÇÃO COM TIMESTAMPS
+# TRANSCRIÇÃO
 # ============================================================
 
 def transcribe(path, model_size):
@@ -107,7 +106,7 @@ def transcribe(path, model_size):
 
 
 # ============================================================
-# ANÁLISE DE ÁUDIO
+# ANÁLISE MUSICAL
 # ============================================================
 
 def audio_analysis(path):
@@ -177,13 +176,12 @@ def audio_analysis(path):
 
 
 # ============================================================
-# ENERGIA EM DETERMINADO MOMENTO
+# ENERGIA
 # ============================================================
 
 def energy_at(audio_data, time):
 
     if len(audio_data["times"]) == 0:
-
         return 0.5
 
     index = int(
@@ -215,7 +213,6 @@ def beat_strength(
     beats = audio_data["beats"]
 
     if len(beats) == 0:
-
         return 0
 
     amount = np.mean(
@@ -229,7 +226,7 @@ def beat_strength(
 
 
 # ============================================================
-# DIVISÃO INTELIGENTE DAS PALAVRAS
+# DIVISÃO INTELIGENTE DA LETRA
 # ============================================================
 
 def group_words(words):
@@ -292,7 +289,6 @@ def group_words(words):
             current.append(word)
 
     if current:
-
         groups.append(current)
 
     phrases = []
@@ -314,7 +310,7 @@ def group_words(words):
 
 
 # ============================================================
-# IMPACT SCORE
+# IMPACTO VISUAL
 # ============================================================
 
 def score_phrases(
@@ -369,12 +365,45 @@ def score_phrases(
 
 
 # ============================================================
-# TEXTO → PNG
+# FONTE AUTOMÁTICA
+# ============================================================
+
+def font_path(directory):
+
+    candidates = [
+
+        # Serifada elegante
+        "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf",
+
+        "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
+
+        # Alternativas
+        "/usr/share/fonts/truetype/liberation2/LiberationSerif-Bold.ttf",
+
+        "/usr/share/fonts/truetype/liberation2/LiberationSerif-Regular.ttf",
+
+        # Último fallback
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ]
+
+    for candidate in candidates:
+
+        if Path(candidate).exists():
+            return candidate
+
+    raise RuntimeError(
+        "Nenhuma fonte compatível foi encontrada "
+        "no ambiente do Streamlit."
+    )
+
+
+# ============================================================
+# TEXTO → IMAGEM
 # ============================================================
 
 def text_image(
     text,
-    font_path,
+    font_path_value,
     size,
     color,
 ):
@@ -386,7 +415,7 @@ def text_image(
     )
 
     font = ImageFont.truetype(
-        font_path,
+        font_path_value,
         size,
     )
 
@@ -427,13 +456,11 @@ def text_image(
         else:
 
             if current:
-
                 lines.append(current)
 
             current = word
 
     if current:
-
         lines.append(current)
 
     gap = 14
@@ -479,7 +506,7 @@ def text_image(
             width - line_width
         ) / 2
 
-        # sombra
+        # Sombra
         draw.text(
             (x + 3, y + 3),
             line,
@@ -487,7 +514,7 @@ def text_image(
             fill=(0, 0, 0, 150),
         )
 
-        # texto
+        # Texto
         draw.text(
             (x, y),
             line,
@@ -501,42 +528,6 @@ def text_image(
         )
 
     return np.asarray(image)
-
-
-# ============================================================
-# FONTE
-# ============================================================
-
-def font_path(
-    uploaded_font,
-    directory,
-):
-
-    if uploaded_font:
-
-        return str(
-            save_upload(
-                uploaded_font,
-                directory,
-                "font.ttf",
-            )
-        )
-
-    candidates = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
-    ]
-
-    for candidate in candidates:
-
-        if Path(candidate).exists():
-
-            return candidate
-
-    raise RuntimeError(
-        "Fonte Unicode não encontrada. "
-        "Envie uma fonte .ttf ou .otf."
-    )
 
 
 # ============================================================
@@ -584,12 +575,15 @@ def render(
             .without_audio()
         )
 
-    layers = [
+    background = (
         ColorClip(
-            (WIDTH, HEIGHT),
+            size=(WIDTH, HEIGHT),
             color=(0, 0, 0),
-        ).with_duration(duration)
-    ]
+        )
+        .with_duration(duration)
+    )
+
+    layers = [background]
 
     try:
 
@@ -610,12 +604,14 @@ def render(
             length = end - start
 
             if length <= 0:
-
                 continue
 
             impact = phrase["impact"]
 
-            # decide se entra o vídeo do cantor
+            # =================================================
+            # VÍDEO DO CANTOR
+            # =================================================
+
             use_live = (
                 show_clip is not None
                 and (
@@ -645,12 +641,9 @@ def render(
                         show_duration,
                     )
 
-                    if (
-                        show_end
-                        > show_start
-                    ):
+                    if show_end > show_start:
 
-                        background = (
+                        live = (
                             show_clip
                             .subclipped(
                                 show_start,
@@ -661,31 +654,32 @@ def render(
                             )
                         )
 
-                        if background.w < WIDTH:
+                        if live.w < WIDTH:
 
-                            background = (
-                                background
+                            live = (
+                                live
                                 .resized(
                                     width=WIDTH
                                 )
                             )
 
-                        background = (
-                            background
+                        live = (
+                            live
                             .cropped(
-                                x_center=background.w / 2,
-                                y_center=background.h / 2,
+                                x_center=live.w / 2,
+                                y_center=live.h / 2,
                                 width=WIDTH,
                                 height=HEIGHT,
                             )
                             .with_start(start)
                         )
 
-                        layers.append(
-                            background
-                        )
+                        layers.append(live)
 
-            # alternância preto/branco
+            # =================================================
+            # ALTERNÂNCIA VISUAL
+            # =================================================
+
             light_background = (
                 index % 4 == 2
                 and impact < 0.72
@@ -695,12 +689,16 @@ def render(
 
                 layers.append(
                     ColorClip(
-                        (WIDTH, HEIGHT),
+                        size=(WIDTH, HEIGHT),
                         color=(245, 245, 245),
                     )
                     .with_start(start)
                     .with_duration(length)
                 )
+
+            # =================================================
+            # TAMANHO DINÂMICO
+            # =================================================
 
             font_size = max(
                 52,
@@ -739,6 +737,10 @@ def render(
                 .with_duration(length)
             )
 
+            # =================================================
+            # FADE DINÂMICO
+            # =================================================
+
             fade = min(
                 0.20 - impact * 0.10,
                 length / 3,
@@ -756,9 +758,11 @@ def render(
                 ]
             )
 
-            layers.append(
-                text_clip
-            )
+            layers.append(text_clip)
+
+        # =====================================================
+        # COMPOSIÇÃO FINAL
+        # =====================================================
 
         final = (
             CompositeVideoClip(
@@ -783,7 +787,6 @@ def render(
     finally:
 
         if show_clip:
-
             show_clip.close()
 
         audio.close()
@@ -794,12 +797,13 @@ def render(
 # ============================================================
 
 st.title(
-    "🎵 Lyric AI — Definitive Engine"
+    "🎵 Lyric AI"
 )
 
 st.caption(
-    "Timestamps reais + energia + batida "
-    "+ Style DNA + cortes seletivos de show + 9:16."
+    "Gerador automático de lyric videos "
+    "9:16 com sincronização, energia, "
+    "batidas e análise visual."
 )
 
 
@@ -817,7 +821,7 @@ music = st.file_uploader(
 
 
 show = st.file_uploader(
-    "🎤 Vídeo do cantor/show (opcional)",
+    "🎤 Vídeo do cantor/show — opcional",
     type=[
         "mp4",
         "mov",
@@ -828,7 +832,7 @@ show = st.file_uploader(
 
 
 references = st.file_uploader(
-    "🎞️ 3–5 vídeos-base (recomendado)",
+    "🎞️ Vídeos-base — envie 3 a 5",
     type=[
         "mp4",
         "mov",
@@ -839,21 +843,11 @@ references = st.file_uploader(
 )
 
 
-font = st.file_uploader(
-    "🔤 Fonte .ttf/.otf "
-    "(opcional — envie Larken se tiver)",
-    type=[
-        "ttf",
-        "otf",
-    ],
-)
-
-
 lyrics = st.text_area(
-    "📝 Letra (opcional)",
+    "📝 Letra — opcional",
     height=140,
     placeholder=(
-        "Se deixar vazio, a IA transcreve "
+        "Deixe vazio para a IA transcrever "
         "automaticamente."
     ),
 )
@@ -877,7 +871,7 @@ model = st.selectbox(
 if references:
 
     with st.spinner(
-        "Analisando os vídeos-base..."
+        "🧬 Analisando seus vídeos-base..."
     ):
 
         st.session_state.style_dna = (
@@ -901,7 +895,7 @@ with st.expander(
 
 
 # ============================================================
-# GERAR
+# GERAR VÍDEO
 # ============================================================
 
 if st.button(
@@ -913,13 +907,13 @@ if st.button(
     if not music:
 
         st.error(
-            "Envie a música primeiro."
+            "🎵 Envie uma música ou vídeo primeiro."
         )
 
         st.stop()
 
     with st.status(
-        "🎬 Construindo...",
+        "🎬 Construindo seu vídeo...",
         expanded=True,
     ) as status:
 
@@ -931,6 +925,10 @@ if st.button(
 
                 directory = Path(temp)
 
+                # =============================================
+                # MÚSICA
+                # =============================================
+
                 music_path = save_upload(
                     music,
                     directory,
@@ -939,6 +937,10 @@ if st.button(
                         music.name
                     ).suffix,
                 )
+
+                # =============================================
+                # VÍDEO DO CANTOR
+                # =============================================
 
                 show_path = (
                     save_upload(
@@ -953,20 +955,35 @@ if st.button(
                     else None
                 )
 
+                # =============================================
+                # FONTE AUTOMÁTICA
+                # =============================================
+
                 selected_font = font_path(
-                    font,
-                    directory,
+                    directory
                 )
+
+                # =============================================
+                # EXTRAÇÃO DO ÁUDIO
+                # =============================================
 
                 audio_path = music_path
 
-                # Se for vídeo, extrair áudio
-                if music_path.suffix.lower() in {
+                video_extensions = {
                     ".mp4",
                     ".mov",
                     ".webm",
                     ".m4v",
-                }:
+                }
+
+                if (
+                    music_path.suffix.lower()
+                    in video_extensions
+                ):
+
+                    status.write(
+                        "🎧 Extraindo áudio..."
+                    )
 
                     video = VideoFileClip(
                         str(music_path)
@@ -977,7 +994,7 @@ if st.button(
                         video.close()
 
                         raise RuntimeError(
-                            "O vídeo não possui áudio."
+                            "O vídeo enviado não possui áudio."
                         )
 
                     audio_path = (
@@ -992,9 +1009,12 @@ if st.button(
 
                     video.close()
 
-                # análise musical
+                # =============================================
+                # ANÁLISE MUSICAL
+                # =============================================
+
                 status.write(
-                    "🎧 Analisando batidas e energia..."
+                    "🥁 Analisando batidas e energia..."
                 )
 
                 audio_data = audio_analysis(
@@ -1003,15 +1023,18 @@ if st.button(
 
                 status.write(
                     f"✓ BPM estimado: "
-                    f"{audio_data['tempo']:.1f} "
-                    f"| duração: "
+                    f"{audio_data['tempo']:.1f}"
+                    f" | duração: "
                     f"{audio_data['duration']:.1f}s"
                 )
 
-                # transcrição
+                # =============================================
+                # TRANSCRIÇÃO
+                # =============================================
+
                 status.write(
-                    "🗣️ Transcrevendo com "
-                    "timestamps de palavras..."
+                    "🗣️ Identificando a letra "
+                    "com timestamps..."
                 )
 
                 words, language = transcribe(
@@ -1021,11 +1044,18 @@ if st.button(
 
                 status.write(
                     f"✓ {len(words)} palavras "
-                    f"| idioma detectado: "
-                    f"{language}"
+                    f"| idioma: {language}"
                 )
 
-                # frases
+                # =============================================
+                # FRASES
+                # =============================================
+
+                status.write(
+                    "✂️ Escolhendo os melhores cortes "
+                    "das frases..."
+                )
+
                 phrases = group_words(
                     words
                 )
@@ -1039,19 +1069,21 @@ if st.button(
                 if lyrics.strip():
 
                     status.write(
-                        "✓ Letra fornecida usada "
-                        "como referência; "
-                        "timing vem da voz."
+                        "✓ Letra fornecida detectada. "
+                        "O timing continua baseado na voz."
                     )
 
-                # render
+                # =============================================
+                # RENDER
+                # =============================================
+
                 output = (
                     directory
                     / "lyric_ai_definitive.mp4"
                 )
 
                 status.write(
-                    "🎬 Renderizando..."
+                    "🎬 Renderizando vídeo 9:16..."
                 )
 
                 render(
@@ -1068,7 +1100,10 @@ if st.button(
                     str(output),
                 )
 
-                # guardar resultado
+                # =============================================
+                # SALVAR RESULTADO
+                # =============================================
+
                 st.session_state.result_video = (
                     output.read_bytes()
                 )
@@ -1082,7 +1117,7 @@ if st.button(
         except Exception as error:
 
             status.update(
-                label="❌ Geração falhou",
+                label="❌ A geração falhou",
                 state="error",
                 expanded=True,
             )
@@ -1107,7 +1142,7 @@ if st.session_state.result_video:
     st.divider()
 
     st.header(
-        "🎬 Resultado"
+        "🎬 Seu lyric video"
     )
 
     st.video(
@@ -1121,4 +1156,3 @@ if st.session_state.result_video:
         "video/mp4",
         use_container_width=True,
     )
-    
