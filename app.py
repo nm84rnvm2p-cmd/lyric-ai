@@ -1,375 +1,475 @@
-from __future__ import annotations
-
-import tempfile
+import os
 import re
+import math
+import wave
+import shutil
+import tempfile
+import subprocess
 from pathlib import Path
+from dataclasses import dataclass
 
 import numpy as np
 import streamlit as st
+import imageio_ffmpeg
+
+from PIL import Image, ImageDraw, ImageFont
+from matplotlib import font_manager
+import matplotlib
 
 
 # ============================================================
 # CONFIGURAÇÃO
 # ============================================================
 
+APP_NAME = "LYRIC AI"
+WIDTH = 1080
+HEIGHT = 1920
+FPS = 30
+
+TEMP_ROOT = Path(tempfile.gettempdir()) / "lyric_ai"
+TEMP_ROOT.mkdir(parents=True, exist_ok=True)
+
+FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
+
+
+# ============================================================
+# MODELOS
+# ============================================================
+
+@dataclass
+class Word:
+    text: str
+    start: float
+    end: float
+
+
+@dataclass
+class Phrase:
+    text: str
+    start: float
+    end: float
+    intensity: float = 0.5
+    style_index: int = 0
+
+
+# ============================================================
+# INTERFACE
+# ============================================================
+
 st.set_page_config(
     page_title="Lyric AI",
     page_icon="🎵",
-    layout="centered",
+    layout="centered"
+)
+
+st.markdown(
+    """
+    <style>
+        .stApp {
+            background: #080808;
+        }
+
+        .main-title {
+            font-size: 42px;
+            font-weight: 900;
+            text-align: center;
+            margin-top: 10px;
+            margin-bottom: 0;
+        }
+
+        .subtitle {
+            text-align: center;
+            opacity: 0.72;
+            margin-bottom: 30px;
+        }
+
+        div.stButton > button {
+            width: 100%;
+            border-radius: 14px;
+            height: 52px;
+            font-size: 18px;
+            font-weight: 800;
+        }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+
+st.markdown(
+    '<div class="main-title">🎵 LYRIC AI</div>',
+    unsafe_allow_html=True
+)
+
+st.markdown(
+    '<div class="subtitle">Criação automática de lyric videos verticais</div>',
+    unsafe_allow_html=True
 )
 
 
 # ============================================================
-# ESTADO
+# UTILIDADES
 # ============================================================
 
-if "result_video" not in st.session_state:
-    st.session_state.result_video = None
-
-if "font_library" not in st.session_state:
-    st.session_state.font_library = None
-
-
-# ============================================================
-# BIBLIOTECA AUTOMÁTICA DE FONTES
-# ============================================================
-
-def build_font_library():
-
+def run_cmd(command, timeout=None):
     """
-    Obtém fontes que vêm junto com o matplotlib.
-
-    Isso evita depender de fontes instaladas no servidor
-    do Streamlit.
+    Executa um comando e devolve stdout.
+    Se falhar, lança erro contendo stderr.
     """
-
-    from matplotlib import font_manager
-
-    all_fonts = font_manager.findSystemFonts(
-        fontext="ttf"
+    result = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout
     )
 
-    library = {}
+    if result.returncode != 0:
+        error = result.stderr.decode("utf-8", errors="replace")
+        raise RuntimeError(error[-6000:])
 
-    # --------------------------------------------------------
-    # Procurar famílias interessantes
-    # --------------------------------------------------------
+    return result.stdout
 
-    for path in all_fonts:
 
-        name = Path(path).stem.lower()
+def safe_filename(name):
+    name = Path(name).stem
+    name = re.sub(r"[^a-zA-Z0-9À-ÿ _-]", "", name)
+    name = name.strip()
+    return name or "lyric_video"
 
-        # DejaVu Serif
-        if name == "DejaVuSerif".lower():
-            library["serif"] = path
 
-        elif name == "DejaVuSerif-Bold".lower():
-            library["serif_bold"] = path
+def save_uploaded_file(uploaded, folder, filename=None):
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
 
-        elif name == "DejaVuSerif-Italic".lower():
-            library["serif_italic"] = path
+    if filename is None:
+        filename = uploaded.name
 
-        elif name == "DejaVuSerif-BoldItalic".lower():
-            library["serif_bold_italic"] = path
+    path = folder / filename
 
-        # DejaVu Sans
-        elif name == "DejaVuSans".lower():
-            library["sans"] = path
+    with open(path, "wb") as f:
+        f.write(uploaded.getbuffer())
 
-        elif name == "DejaVuSans-Bold".lower():
-            library["sans_bold"] = path
+    return path
 
-        elif name == "DejaVuSans-Oblique".lower():
-            library["sans_italic"] = path
 
-        # Condensed
-        elif name == "DejaVuSansCondensed".lower():
-            library["condensed"] = path
+def ffprobe_duration(path):
+    """
+    Descobre a duração de um arquivo usando o ffprobe
+    correspondente ao FFmpeg disponibilizado pelo imageio-ffmpeg.
+    """
+    ffprobe = FFMPEG.replace("ffmpeg", "ffprobe")
 
-        elif name == "DejaVuSansCondensed-Bold".lower():
-            library["condensed_bold"] = path
+    if not Path(ffprobe).exists():
+        # fallback: usa ffmpeg
+        command = [
+            FFMPEG,
+            "-i",
+            str(path)
+        ]
 
-        # Mono
-        elif name == "DejaVuSansMono".lower():
-            library["mono"] = path
+        try:
+            result = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
 
-        # STIX
-        elif name == "STIXGeneral".lower():
-            library["stix"] = path
+            text = result.stderr.decode(
+                "utf-8",
+                errors="replace"
+            )
 
-        elif name == "STIXGeneral-Bold".lower():
-            library["stix_bold"] = path
+            match = re.search(
+                r"Duration:\s*(\d+):(\d+):([\d.]+)",
+                text
+            )
 
-        elif name == "STIXGeneral-Italic".lower():
-            library["stix_italic"] = path
+            if match:
+                h = int(match.group(1))
+                m = int(match.group(2))
+                s = float(match.group(3))
+                return h * 3600 + m * 60 + s
 
-    # --------------------------------------------------------
-    # Fallbacks
-    # --------------------------------------------------------
+        except Exception:
+            pass
 
-    if "serif" not in library:
-        library["serif"] = library.get(
-            "sans",
-            None
+    try:
+        result = subprocess.run(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(path)
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
         )
 
-    if "serif_bold" not in library:
-        library["serif_bold"] = library.get(
-            "serif"
+        value = result.stdout.decode().strip()
+
+        if value:
+            return float(value)
+
+    except Exception:
+        pass
+
+    raise RuntimeError(
+        "Não consegui descobrir a duração do arquivo."
+    )
+
+
+# ============================================================
+# ÁUDIO
+# ============================================================
+
+def extract_audio_from_video(video_path, output_path):
+    """
+    Extrai o áudio de um vídeo para WAV PCM.
+    """
+    command = [
+        FFMPEG,
+        "-y",
+        "-i",
+        str(video_path),
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-c:a",
+        "pcm_s16le",
+        str(output_path)
+    ]
+
+    run_cmd(command, timeout=600)
+
+
+def normalize_audio(input_path, output_path):
+    """
+    Converte qualquer áudio para WAV PCM mono 16 kHz.
+    """
+    command = [
+        FFMPEG,
+        "-y",
+        "-i",
+        str(input_path),
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-c:a",
+        "pcm_s16le",
+        str(output_path)
+    ]
+
+    run_cmd(command, timeout=600)
+
+
+def calculate_audio_energy(audio_path):
+    """
+    Calcula energia média do áudio em pequenas janelas.
+    Serve para o sistema decidir onde aumentar o impacto visual.
+    """
+    try:
+        with wave.open(str(audio_path), "rb") as wav:
+            rate = wav.getframerate()
+            frames = wav.readframes(wav.getnframes())
+
+        audio = np.frombuffer(
+            frames,
+            dtype=np.int16
+        ).astype(np.float32)
+
+        if len(audio) == 0:
+            return []
+
+        audio /= 32768.0
+
+        window = max(1, int(rate * 0.25))
+
+        values = []
+
+        for i in range(0, len(audio), window):
+            chunk = audio[i:i + window]
+
+            if len(chunk) == 0:
+                continue
+
+            rms = float(
+                np.sqrt(
+                    np.mean(
+                        np.square(chunk)
+                    ) + 1e-9
+                )
+            )
+
+            values.append(rms)
+
+        if not values:
+            return []
+
+        arr = np.array(values)
+
+        low = np.percentile(arr, 10)
+        high = np.percentile(arr, 90)
+
+        if high <= low:
+            return [0.5] * len(arr)
+
+        normalized = np.clip(
+            (arr - low) / (high - low),
+            0,
+            1
         )
 
-    if "serif_italic" not in library:
-        library["serif_italic"] = library.get(
-            "serif"
-        )
+        return normalized.tolist()
 
-    if "sans" not in library:
-        library["sans"] = library.get(
-            "serif"
-        )
+    except Exception:
+        return []
 
-    if "sans_bold" not in library:
-        library["sans_bold"] = library.get(
-            "sans"
-        )
 
-    if "condensed" not in library:
-        library["condensed"] = library.get(
-            "sans"
-        )
+def energy_at_time(energy, time_sec):
+    if not energy:
+        return 0.5
 
-    if "condensed_bold" not in library:
-        library["condensed_bold"] = library.get(
-            "sans_bold"
-        )
+    index = int(time_sec / 0.25)
 
-    if "stix" not in library:
-        library["stix"] = library.get(
-            "serif"
-        )
+    index = max(
+        0,
+        min(index, len(energy) - 1)
+    )
 
-    if "stix_bold" not in library:
-        library["stix_bold"] = library.get(
-            "serif_bold"
-        )
+    return float(energy[index])
 
-    if "stix_italic" not in library:
-        library["stix_italic"] = library.get(
-            "serif_italic"
-        )
 
-    return library
-
+# ============================================================
+# FONTES
+# ============================================================
 
 @st.cache_resource
-def get_font_library():
+def build_font_library():
+    """
+    Constrói uma biblioteca local de fontes.
 
-    library = build_font_library()
+    A lógica NÃO depende de uma única fonte.
+    Se algumas não existirem, outras são utilizadas.
 
-    if not library:
+    O matplotlib também possui fontes próprias, garantindo
+    um fallback mesmo em ambientes muito restritos.
+    """
 
+    candidates = []
+
+    system_fonts = []
+
+    try:
+        system_fonts = font_manager.findSystemFonts(
+            fontpaths=None,
+            fontext="ttf"
+        )
+    except Exception:
+        system_fonts = []
+
+    try:
+        system_fonts += font_manager.findSystemFonts(
+            fontpaths=None,
+            fontext="otf"
+        )
+    except Exception:
+        pass
+
+    # Fontes procuradas primeiro.
+    preferred_keywords = [
+        "Inter",
+        "Lato",
+        "LiberationSans",
+        "LiberationSerif",
+        "DejaVuSansCondensed",
+        "DejaVuSans",
+        "DejaVuSerif",
+        "DejaVuSansMono",
+        "STIXGeneral"
+    ]
+
+    for keyword in preferred_keywords:
+        matches = [
+            p for p in system_fonts
+            if keyword.lower() in Path(p).name.lower()
+        ]
+
+        # Dá preferência às versões fortes.
+        matches.sort(
+            key=lambda p: (
+                "Bold" not in Path(p).name,
+                "Medium" not in Path(p).name,
+                len(Path(p).name)
+            )
+        )
+
+        if matches:
+            candidates.append(matches[0])
+
+    # Fallback garantido usando as fontes do matplotlib.
+    mpl_font_dir = (
+        Path(matplotlib.get_data_path())
+        / "fonts"
+        / "ttf"
+    )
+
+    fallback_names = [
+        "DejaVuSans-Bold.ttf",
+        "DejaVuSans.ttf",
+        "DejaVuSansCondensed-Bold.ttf",
+        "DejaVuSerif-Bold.ttf",
+        "DejaVuSerif.ttf",
+        "DejaVuSansMono-Bold.ttf",
+        "STIXGeneral-Bold.ttf",
+        "STIXGeneral-Italic.ttf",
+    ]
+
+    for name in fallback_names:
+        p = mpl_font_dir / name
+
+        if p.exists():
+            candidates.append(str(p))
+
+    # Remove duplicatas.
+    unique = []
+
+    for p in candidates:
+        p = str(p)
+
+        if os.path.exists(p) and p not in unique:
+            unique.append(p)
+
+    # Caso extremo: uma única fonte fallback.
+    if not unique:
         raise RuntimeError(
-            "Não foi possível carregar nenhuma fonte."
+            "Não foi possível localizar nenhuma fonte compatível."
         )
 
-    return library
+    # Mantém no máximo 10.
+    return unique[:10]
 
 
-# ============================================================
-# ESCOLHA AUTÔNOMA DA FONTE
-# ============================================================
+def get_font(font_index):
+    fonts = build_font_library()
 
-def choose_font(
-    phrase,
-    energy,
-    impact,
-    beat,
-    index,
-    library,
-):
-    """
-    O sistema escolhe a fonte sem intervenção do usuário.
-
-    A escolha depende de:
-    - energia musical
-    - força da frase
-    - presença de batida
-    - tamanho da frase
-    - pontuação
-    - posição dentro da música
-    """
-
-    text = phrase["text"]
-
-    length = len(text)
-
-    upper_ratio = (
-        sum(
-            1 for c in text
-            if c.isupper()
-        )
-        / max(
-            1,
-            sum(
-                1 for c in text
-                if c.isalpha()
-            ),
-        )
-    )
-
-    has_exclamation = (
-        "!" in text
-    )
-
-    has_question = (
-        "?" in text
-    )
-
-    # --------------------------------------------------------
-    # FRASE MUITO FORTE
-    # --------------------------------------------------------
-
-    if (
-        impact >= 0.85
-        or energy >= 0.90
-        or has_exclamation
-    ):
-
-        if library.get("serif_bold"):
-            return (
-                library["serif_bold"],
-                "serif_bold",
-            )
-
-    # --------------------------------------------------------
-    # TRECHO EMOCIONAL
-    # --------------------------------------------------------
-
-    if (
-        impact >= 0.68
-        and energy < 0.55
-    ):
-
-        if library.get("serif_italic"):
-            return (
-                library["serif_italic"],
-                "serif_italic",
-            )
-
-    # --------------------------------------------------------
-    # TRECHO MUITO RÁPIDO
-    # --------------------------------------------------------
-
-    if length >= 38:
-
-        if library.get("condensed"):
-            return (
-                library["condensed"],
-                "condensed",
-            )
-
-    # --------------------------------------------------------
-    # BATIDA FORTE
-    # --------------------------------------------------------
-
-    if beat >= 0.75:
-
-        if library.get("sans_bold"):
-            return (
-                library["sans_bold"],
-                "sans_bold",
-            )
-
-    # --------------------------------------------------------
-    # FRASES CURTAS DE IMPACTO
-    # --------------------------------------------------------
-
-    if (
-        length <= 16
-        and impact >= 0.60
-    ):
-
-        if library.get("stix_bold"):
-            return (
-                library["stix_bold"],
-                "stix_bold",
-            )
-
-    # --------------------------------------------------------
-    # PERGUNTAS
-    # --------------------------------------------------------
-
-    if has_question:
-
-        if library.get("stix_italic"):
-            return (
-                library["stix_italic"],
-                "stix_italic",
-            )
-
-    # --------------------------------------------------------
-    # ALTERNÂNCIA CONTROLADA
-    # --------------------------------------------------------
-
-    if index % 9 == 6:
-
-        if library.get("serif_italic"):
-            return (
-                library["serif_italic"],
-                "serif_italic",
-            )
-
-    if index % 13 == 8:
-
-        if library.get("sans"):
-            return (
-                library["sans"],
-                "sans",
-            )
-
-    # --------------------------------------------------------
-    # FONTE PRINCIPAL
-    # --------------------------------------------------------
-
-    if library.get("serif"):
-        return (
-            library["serif"],
-            "serif",
+    if not fonts:
+        raise RuntimeError(
+            "Biblioteca de fontes vazia."
         )
 
-    return (
-        library["sans"],
-        "sans",
-    )
+    index = int(font_index) % len(fonts)
 
+    path = fonts[index]
 
-# ============================================================
-# SALVAR UPLOAD
-# ============================================================
-
-def save_upload(
-    uploaded_file,
-    directory,
-    filename,
-):
-
-    suffix = (
-        Path(
-            uploaded_file.name
-        ).suffix.lower()
-    )
-
-    path = (
-        directory
-        / (
-            filename
-            + suffix
-        )
-    )
-
-    path.write_bytes(
-        uploaded_file.getbuffer()
-    )
+    if not os.path.exists(path):
+        path = fonts[0]
 
     return path
 
@@ -378,1280 +478,1328 @@ def save_upload(
 # TRANSCRIÇÃO
 # ============================================================
 
-@st.cache_resource
+@st.cache_resource(show_spinner=False)
 def load_whisper(model_size):
-
     from faster_whisper import WhisperModel
 
     return WhisperModel(
         model_size,
         device="cpu",
         compute_type="int8",
+        cpu_threads=4,
+        num_workers=1
     )
 
 
-def transcribe(
-    path,
-    model_size,
-):
+def transcribe_audio(audio_path, model_size="tiny"):
+    """
+    Transcrição com timestamps por palavra.
+    """
 
-    model = load_whisper(
-        model_size
-    )
+    model = load_whisper(model_size)
 
     segments, info = model.transcribe(
-        path,
+        str(audio_path),
         language="pt",
+        task="transcribe",
         beam_size=5,
         word_timestamps=True,
         vad_filter=True,
-        vad_parameters={
-            "min_silence_duration_ms": 450
-        },
-        condition_on_previous_text=False,
+        condition_on_previous_text=True
     )
 
     words = []
 
     for segment in segments:
 
-        if not segment.words:
-            continue
+        if segment.words:
 
-        for word in segment.words:
+            for word in segment.words:
 
-            if (
-                word.start is not None
-                and word.end is not None
-                and word.word.strip()
-            ):
+                text = (word.word or "").strip()
+
+                if not text:
+                    continue
+
+                start = float(word.start)
+                end = float(word.end)
+
+                if end <= start:
+                    end = start + 0.15
 
                 words.append(
-                    {
-                        "text": word.word.strip(),
-                        "start": float(
-                            word.start
-                        ),
-                        "end": float(
-                            word.end
-                        ),
-                    }
+                    Word(
+                        text=text,
+                        start=start,
+                        end=end
+                    )
                 )
 
+        else:
+
+            text = (segment.text or "").strip()
+
+            if text:
+                words.append(
+                    Word(
+                        text=text,
+                        start=float(segment.start),
+                        end=float(segment.end)
+                    )
+                )
+
+    return words, info
+
+
+# ============================================================
+# FRASES
+# ============================================================
+
+def clean_text(text):
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def create_phrases(words, energy):
+    """
+    Agrupa palavras em frases visualmente adequadas.
+
+    A IA tenta evitar:
+    - frases enormes
+    - frases rápidas demais
+    - blocos estáticos por muito tempo
+
+    Também considera pausas naturais.
+    """
+
     if not words:
+        return []
 
-        raise RuntimeError(
-            "Não foi possível detectar a letra."
+    phrases = []
+
+    current = []
+    current_start = None
+    previous_end = None
+
+    for word in words:
+
+        if current_start is None:
+            current_start = word.start
+
+        pause = 0
+
+        if previous_end is not None:
+            pause = word.start - previous_end
+
+        current_duration = word.end - current_start
+
+        should_break = False
+
+        if current:
+            if pause >= 0.42:
+                should_break = True
+
+            if len(current) >= 7:
+                should_break = True
+
+            if current_duration >= 3.25:
+                should_break = True
+
+            if current[-1].text.endswith(
+                (".", "!", "?", ",", ";", ":")
+            ):
+                if current_duration >= 1.0:
+                    should_break = True
+
+        if should_break:
+
+            text = clean_text(
+                " ".join(w.text for w in current)
+            )
+
+            if text:
+                start = current[0].start
+                end = current[-1].end
+
+                intensity = (
+                    energy_at_time(
+                        energy,
+                        (start + end) / 2
+                    )
+                )
+
+                phrases.append(
+                    Phrase(
+                        text=text,
+                        start=start,
+                        end=end,
+                        intensity=intensity
+                    )
+                )
+
+            current = []
+            current_start = word.start
+
+        current.append(word)
+        previous_end = word.end
+
+    if current:
+
+        text = clean_text(
+            " ".join(w.text for w in current)
         )
 
-    return (
-        words,
-        info.language,
-    )
+        if text:
+
+            start = current[0].start
+            end = current[-1].end
+
+            intensity = energy_at_time(
+                energy,
+                (start + end) / 2
+            )
+
+            phrases.append(
+                Phrase(
+                    text=text,
+                    start=start,
+                    end=end,
+                    intensity=intensity
+                )
+            )
+
+    return phrases
 
 
-# ============================================================
-# ANÁLISE DO ÁUDIO
-# ============================================================
-
-def analyze_audio(path):
-
-    import librosa
-
-    y, sr = librosa.load(
-        path,
-        sr=22050,
-        mono=True,
-    )
-
-    if len(y) == 0:
-
-        raise RuntimeError(
-            "O áudio está vazio."
-        )
-
-    onset = librosa.onset.onset_strength(
-        y=y,
-        sr=sr,
-    )
-
-    tempo, frames = (
-        librosa.beat.beat_track(
-            onset_envelope=onset,
-            sr=sr,
-            units="frames",
-        )
-    )
-
-    beats = librosa.frames_to_time(
-        frames,
-        sr=sr,
-    )
-
-    rms = librosa.feature.rms(
-        y=y,
-        frame_length=2048,
-        hop_length=512,
-    )[0]
-
-    times = librosa.frames_to_time(
-        np.arange(
-            len(rms)
-        ),
-        sr=sr,
-        hop_length=512,
-    )
-
-    low, high = np.percentile(
-        rms,
-        [5, 95],
-    )
-
-    energy = np.clip(
-        (
-            rms - low
-        )
-        / max(
-            high - low,
-            1e-8,
-        ),
-        0,
-        1,
-    )
-
-    return {
-        "duration": float(
-            len(y) / sr
-        ),
-        "tempo": float(
-            np.asarray(
-                tempo
-            ).reshape(-1)[0]
-        ),
-        "beats": beats,
-        "energy": energy,
-        "times": times,
-    }
-
-
-def energy_at(
-    audio,
-    time,
+def create_phrases_from_manual_lyrics(
+    lyrics,
+    duration,
+    energy
 ):
+    """
+    Fallback para quem já possui a letra.
+    O tempo é distribuído proporcionalmente.
+    """
 
-    if len(audio["times"]) == 0:
-        return 0.5
+    lines = [
+        clean_text(x)
+        for x in lyrics.splitlines()
+        if clean_text(x)
+    ]
 
-    index = np.searchsorted(
-        audio["times"],
-        time,
-    )
+    if not lines:
+        return []
 
-    index = int(
-        np.clip(
-            index,
-            0,
-            len(
-                audio["energy"]
-            ) - 1,
+    weights = []
+
+    for line in lines:
+        weights.append(
+            max(
+                1.0,
+                len(line)
+            )
         )
-    )
 
-    return float(
-        audio["energy"][index]
-    )
+    total = sum(weights)
 
+    phrases = []
 
-def beat_strength(
-    audio,
-    start,
-    end,
-):
+    cursor = 0.0
 
-    beats = audio["beats"]
+    for index, line in enumerate(lines):
 
-    if len(beats) == 0:
-        return 0
-
-    amount = np.mean(
-        (
-            beats >= start
+        segment_duration = (
+            duration * weights[index] / total
         )
-        &
-        (
-            beats <= end
-        )
-    )
 
-    return float(
-        np.clip(
-            amount * 2,
-            0,
-            1,
+        start = cursor
+        end = min(
+            duration,
+            cursor + segment_duration
         )
-    )
+
+        phrases.append(
+            Phrase(
+                text=line,
+                start=start,
+                end=end,
+                intensity=energy_at_time(
+                    energy,
+                    (start + end) / 2
+                )
+            )
+        )
+
+        cursor = end
+
+    return phrases
 
 
 # ============================================================
-# AGRUPAR PALAVRAS
+# ESTILO AUTÔNOMO
 # ============================================================
 
-def group_words(words):
+def choose_style(phrase, index, total):
+    """
+    Decide automaticamente o tratamento visual.
 
-    groups = []
+    Não é uma seleção manual:
+    intensidade + comprimento + posição na música
+    influenciam a decisão.
+    """
 
+    intensity = phrase.intensity
+
+    length = len(phrase.text)
+
+    if intensity >= 0.78:
+        style = 0
+    elif intensity >= 0.60:
+        style = 1
+    elif length <= 18:
+        style = 2
+    elif index % 5 == 0:
+        style = 3
+    elif index % 7 == 0:
+        style = 4
+    else:
+        style = 5
+
+    phrase.style_index = style
+
+    return style
+
+
+# ============================================================
+# TEXTO
+# ============================================================
+
+def wrap_words(draw, words, font, max_width):
+    """
+    Quebra o texto em linhas sem ultrapassar o limite.
+    """
+
+    lines = []
     current = []
 
     for word in words:
 
-        if not current:
-
-            current = [word]
-
-            continue
-
-        previous = current[-1]
-
-        gap = (
-            word["start"]
-            - previous["end"]
+        test = (
+            " ".join(current + [word])
         )
 
-        candidate = " ".join(
-            x["text"]
-            for x in (
-                current
-                + [word]
-            )
+        box = draw.textbbox(
+            (0, 0),
+            test,
+            font=font,
+            stroke_width=0
         )
 
-        punctuation = bool(
-            re.search(
-                r"[.!?,;:]$",
-                previous["text"],
-            )
-        )
-
-        too_many = (
-            len(current) >= 7
-        )
-
-        too_long = (
-            len(candidate) > 34
-        )
-
-        too_slow = (
-            word["end"]
-            - current[0]["start"]
-            > 2.8
-        )
+        width = box[2] - box[0]
 
         if (
-            gap >= 0.38
-            or punctuation
-            or too_many
-            or too_long
-            or too_slow
+            width <= max_width
+            or not current
         ):
+            current.append(word)
 
-            groups.append(
-                current
+        else:
+            lines.append(
+                " ".join(current)
             )
 
             current = [word]
 
-        else:
-
-            current.append(
-                word
-            )
-
     if current:
-        groups.append(
-            current
+        lines.append(
+            " ".join(current)
         )
 
-    phrases = []
-
-    for group in groups:
-
-        phrases.append(
-            {
-                "text": " ".join(
-                    x["text"]
-                    for x in group
-                ),
-                "start": group[0][
-                    "start"
-                ],
-                "end": group[-1][
-                    "end"
-                ],
-            }
-        )
-
-    return phrases
+    return lines
 
 
-# ============================================================
-# ANALISAR IMPACTO
-# ============================================================
+def choose_accent_word(words):
+    """
+    Escolhe uma palavra de destaque.
+    """
 
-def score_phrases(
-    phrases,
-    audio,
-):
+    if not words:
+        return ""
 
-    for phrase in phrases:
+    # Evita dar destaque a palavras muito pequenas.
+    meaningful = [
+        w for w in words
+        if len(re.sub(r"\W", "", w)) >= 5
+    ]
 
-        middle = (
-            phrase["start"]
-            + phrase["end"]
-        ) / 2
+    if not meaningful:
+        return words[-1]
 
-        energy = energy_at(
-            audio,
-            middle,
-        )
+    # Palavras mais longas costumam ser mais expressivas
+    # visualmente.
+    return max(
+        meaningful,
+        key=lambda x: len(x)
+    )
 
-        beat = beat_strength(
-            audio,
-            phrase["start"],
-            phrase["end"],
-        )
-
-        duration = max(
-            0.1,
-            phrase["end"]
-            - phrase["start"],
-        )
-
-        short_phrase = np.clip(
-            1
-            - duration / 2.5,
-            0,
-            1,
-        )
-
-        phrase["energy"] = energy
-
-        phrase["beat"] = beat
-
-        phrase["impact"] = float(
-            np.clip(
-                0.48 * energy
-                + 0.27 * beat
-                + 0.25 * short_phrase,
-                0,
-                1,
-            )
-        )
-
-    return phrases
-
-
-# ============================================================
-# RENDERIZAR TEXTO
-# ============================================================
 
 def make_text_image(
     text,
     font_path,
-    font_size,
-    color,
+    intensity,
+    style_index,
+    output_path
 ):
+    """
+    Cria PNG transparente da frase.
 
-    from PIL import (
-        Image,
-        ImageDraw,
-        ImageFont,
-    )
+    Isso evita completamente a dependência do
+    ImageFont.truetype(None) que causava o erro anterior.
+    """
 
-    WIDTH = 960
-    HEIGHT = 600
+    # Segurança absoluta.
+    if not font_path:
+        font_path = get_font(0)
 
-    image = Image.new(
-        "RGBA",
-        (
-            WIDTH,
-            HEIGHT,
-        ),
-        (
-            0,
-            0,
-            0,
-            0,
-        ),
-    )
+    if not os.path.exists(font_path):
+        font_path = get_font(0)
 
-    draw = ImageDraw.Draw(
-        image
-    )
+    # Tamanho autônomo.
+    if intensity >= 0.80:
+        size = 92
+    elif intensity >= 0.60:
+        size = 84
+    else:
+        size = 76
+
+    if len(text) <= 18:
+        size += 8
 
     font = ImageFont.truetype(
         font_path,
-        font_size,
+        size=size
     )
-
-    # --------------------------------------------------------
-    # QUEBRA DE LINHA
-    # --------------------------------------------------------
 
     words = text.split()
 
-    lines = []
+    # Tela de texto transparente.
+    canvas_width = 1000
+    canvas_height = 500
 
-    current = ""
+    image = Image.new(
+        "RGBA",
+        (canvas_width, canvas_height),
+        (0, 0, 0, 0)
+    )
 
-    for word in words:
+    draw = ImageDraw.Draw(image)
 
-        test = (
-            word
-            if not current
-            else current
-            + " "
-            + word
-        )
+    lines = wrap_words(
+        draw,
+        words,
+        font,
+        900
+    )
 
-        bbox = draw.textbbox(
-            (0, 0),
-            test,
-            font=font,
-        )
+    # Altura total.
+    line_height = int(size * 1.18)
 
-        if bbox[2] <= WIDTH - 80:
-
-            current = test
-
-        else:
-
-            if current:
-                lines.append(
-                    current
-                )
-
-            current = word
-
-    if current:
-        lines.append(
-            current
-        )
-
-    # --------------------------------------------------------
-    # ALTURA
-    # --------------------------------------------------------
-
-    spacing = 16
-
-    boxes = [
-        draw.textbbox(
-            (0, 0),
-            line,
-            font=font,
-        )
-        for line in lines
-    ]
-
-    heights = [
-        box[3] - box[1]
-        for box in boxes
-    ]
-
-    total = (
-        sum(heights)
-        + spacing
-        * max(
-            0,
-            len(heights) - 1,
-        )
+    total_height = (
+        len(lines) * line_height
     )
 
     y = (
-        HEIGHT - total
-    ) / 2
+        canvas_height - total_height
+    ) // 2
 
-    # --------------------------------------------------------
-    # TEXTO
-    # --------------------------------------------------------
+    accent_word = choose_accent_word(words)
 
-    for line, box, height in zip(
-        lines,
-        boxes,
-        heights,
-    ):
+    # Paleta simples para manter a aparência elegante.
+    normal_color = (255, 255, 255, 255)
 
-        line_width = (
-            box[2]
-            - box[0]
-        )
+    accent_colors = [
+        (255, 255, 255, 255),
+        (245, 215, 150, 255),
+        (255, 230, 190, 255),
+        (220, 230, 255, 255)
+    ]
+
+    accent_color = accent_colors[
+        style_index % len(accent_colors)
+    ]
+
+    for line in lines:
+
+        line_words = line.split()
+
+        # Medidas individuais.
+        measurements = []
+
+        total_width = 0
+
+        for word in line_words:
+
+            box = draw.textbbox(
+                (0, 0),
+                word,
+                font=font,
+                stroke_width=0
+            )
+
+            word_width = (
+                box[2] - box[0]
+            )
+
+            space_box = draw.textbbox(
+                (0, 0),
+                " ",
+                font=font
+            )
+
+            space_width = (
+                space_box[2] - space_box[0]
+            )
+
+            measurements.append(
+                (
+                    word,
+                    word_width,
+                    space_width
+                )
+            )
+
+            total_width += (
+                word_width
+                + space_width
+            )
 
         x = (
-            WIDTH
-            - line_width
+            canvas_width - total_width
         ) / 2
 
-        # Sombra
-        draw.text(
+        for word, word_width, space_width in measurements:
+
+            is_accent = (
+                word.lower().strip(
+                    ".,!?;:"
+                )
+                ==
+                accent_word.lower().strip(
+                    ".,!?;:"
+                )
+            )
+
+            # Sombra forte para leitura sobre qualquer fundo.
+            draw.text(
+                (x + 5, y + 6),
+                word,
+                font=font,
+                fill=(0, 0, 0, 210),
+                stroke_width=7,
+                stroke_fill=(0, 0, 0, 220)
+            )
+
+            draw.text(
+                (x, y),
+                word,
+                font=font,
+                fill=(
+                    accent_color
+                    if is_accent
+                    else normal_color
+                ),
+                stroke_width=3,
+                stroke_fill=(0, 0, 0, 190)
+            )
+
+            x += (
+                word_width
+                + space_width
+            )
+
+        y += line_height
+
+    # Remove espaços vazios excessivos.
+    bbox = image.getbbox()
+
+    if bbox:
+        image = image.crop(
             (
-                x + 4,
-                y + 4,
-            ),
-            line,
-            font=font,
-            fill=(
-                0,
-                0,
-                0,
-                160,
-            ),
+                max(0, bbox[0] - 35),
+                max(0, bbox[1] - 35),
+                min(
+                    image.width,
+                    bbox[2] + 35
+                ),
+                min(
+                    image.height,
+                    bbox[3] + 35
+                )
+            )
         )
 
-        # Texto
-        draw.text(
-            (
-                x,
-                y,
-            ),
-            line,
-            font=font,
-            fill=color,
-        )
+    image.save(
+        output_path,
+        "PNG"
+    )
 
-        y += (
-            height
-            + spacing
-        )
+    return output_path
 
-    return np.asarray(
-        image
+
+# ============================================================
+# BACKGROUND
+# ============================================================
+
+def build_background_filter(duration):
+    """
+    Fundo abstrato original.
+
+    Não utiliza imagens de terceiros.
+    """
+
+    # Gradiente animado.
+    return (
+        "nullsrc="
+        f"s={WIDTH}x{HEIGHT}:"
+        f"r={FPS},"
+        "geq="
+        "r='12+12*sin(X/170+N/40)+"
+        "8*sin(Y/300-N/55)',"
+        "g='8+8*sin(X/240-N/50)+"
+        "7*sin(Y/260+N/70)',"
+        "b='18+18*sin(X/300+N/70)+"
+        "12*sin(Y/200-N/60)',"
+        "format=yuv420p,"
+        "vignette=PI/4"
+    )
+
+
+def build_video_background_filter():
+    """
+    Prepara vídeo enviado pelo usuário para 9:16.
+    """
+
+    return (
+        "[0:v]"
+        f"scale={WIDTH}:{HEIGHT}:"
+        "force_original_aspect_ratio=increase,"
+        f"crop={WIDTH}:{HEIGHT},"
+        "setsar=1,"
+        "eq=brightness=-0.10:"
+        "saturation=0.82,"
+        "format=yuv420p"
+        "[bg]"
     )
 
 
 # ============================================================
-# RENDER FINAL
+# RENDER
 # ============================================================
 
 def render_video(
     audio_path,
-    show_path,
+    background_path,
     phrases,
-    audio,
-    library,
-    output_path,
+    workdir,
+    output_path
 ):
+    """
+    Renderiza o vídeo final.
 
-    from moviepy import (
-        AudioFileClip,
-        ColorClip,
-        CompositeVideoClip,
-        ImageClip,
-        VideoFileClip,
+    Usa FFmpeg diretamente.
+    Não usa MoviePy.
+    """
+
+    workdir = Path(workdir)
+    output_path = Path(output_path)
+
+    duration = ffprobe_duration(
+        audio_path
     )
 
-    from moviepy import vfx
+    duration = max(
+        1.0,
+        float(duration)
+    )
 
-    WIDTH = 1080
-    HEIGHT = 1920
+    # --------------------------------------------------------
+    # Geração das imagens de texto
+    # --------------------------------------------------------
 
-    audio_clip = AudioFileClip(
+    text_files = []
+
+    fonts = build_font_library()
+
+    for i, phrase in enumerate(phrases):
+
+        style = choose_style(
+            phrase,
+            i,
+            len(phrases)
+        )
+
+        font_path = fonts[
+            style % len(fonts)
+        ]
+
+        text_path = (
+            workdir
+            / f"text_{i:04d}.png"
+        )
+
+        make_text_image(
+            phrase.text,
+            font_path,
+            phrase.intensity,
+            style,
+            text_path
+        )
+
+        text_files.append(
+            text_path
+        )
+
+    # --------------------------------------------------------
+    # Construção dos inputs
+    # --------------------------------------------------------
+
+    command = [
+        FFMPEG,
+        "-y"
+    ]
+
+    if background_path:
+
+        command += [
+            "-stream_loop",
+            "-1",
+            "-i",
+            str(background_path)
+        ]
+
+        audio_index = 1
+        first_text_index = 2
+
+    else:
+
+        audio_index = 0
+        first_text_index = 1
+
+    command += [
+        "-i",
         str(audio_path)
-    )
+    ]
 
-    duration = min(
-        float(
-            audio_clip.duration
-        ),
-        audio["duration"],
-    )
+    # Cada PNG é transformado em vídeo temporário.
+    for i, text_path in enumerate(text_files):
 
-    layers = []
+        phrase = phrases[i]
 
-    background = (
-        ColorClip(
-            size=(
-                WIDTH,
-                HEIGHT,
-            ),
-            color=(
-                0,
-                0,
-                0,
-            ),
+        phrase_duration = max(
+            0.25,
+            phrase.end - phrase.start
         )
-        .with_duration(
-            duration
+
+        command += [
+            "-loop",
+            "1",
+            "-t",
+            str(
+                phrase_duration + 0.25
+            ),
+            "-i",
+            str(text_path)
+        ]
+
+    # --------------------------------------------------------
+    # FILTER COMPLEX
+    # --------------------------------------------------------
+
+    filters = []
+
+    if background_path:
+
+        filters.append(
+            build_video_background_filter()
         )
-    )
 
-    layers.append(
-        background
-    )
+    else:
 
-    show_clip = None
-
-    if show_path:
-
-        show_clip = (
-            VideoFileClip(
-                str(show_path)
+        filters.append(
+            build_background_filter(
+                duration
             )
-            .without_audio()
+            + "[bg]"
         )
+
+    current = "bg"
+
+    for i, phrase in enumerate(phrases):
+
+        input_index = (
+            first_text_index + i
+        )
+
+        text_label = f"txt{i}"
+
+        output_label = f"v{i}"
+
+        phrase_duration = max(
+            0.25,
+            phrase.end - phrase.start
+        )
+
+        fade = min(
+            0.16,
+            phrase_duration / 4
+        )
+
+        # Movimento pequeno para não deixar
+        # as letras completamente estáticas.
+        motion_x = (
+            f"(W-w)/2+"
+            f"12*sin(2*PI*t/1.7)"
+        )
+
+        if i % 3 == 0:
+            base_y = "(H-h)/2-130"
+        elif i % 3 == 1:
+            base_y = "(H-h)/2"
+        else:
+            base_y = "(H-h)/2+110"
+
+        # Zoom extremamente discreto.
+        scale_expr_w = (
+            "iw*(1+0.025*sin(2*PI*t/2.0))"
+        )
+
+        scale_expr_h = (
+            "ih*(1+0.025*sin(2*PI*t/2.0))"
+        )
+
+        filters.append(
+            f"[{input_index}:v]"
+            "format=rgba,"
+            f"fade=t=in:st=0:d={fade}:alpha=1,"
+            f"fade=t=out:"
+            f"st={max(0.01, phrase_duration-fade)}:"
+            f"d={fade}:alpha=1,"
+            f"scale="
+            f"w='{scale_expr_w}':"
+            f"h='{scale_expr_h}':"
+            "eval=frame,"
+            f"setpts=PTS-STARTPTS"
+            f"[{text_label}]"
+        )
+
+        filters.append(
+            f"[{current}]"
+            f"[{text_label}]"
+            "overlay="
+            f"x='{motion_x}':"
+            f"y='{base_y}':"
+            "eval=frame:"
+            f"enable='between(t,"
+            f"{phrase.start},"
+            f"{phrase.end})'"
+            f"[{output_label}]"
+        )
+
+        current = output_label
+
+    filter_complex = ";".join(filters)
+
+    command += [
+        "-filter_complex",
+        filter_complex,
+        "-map",
+        f"[{current}]",
+        "-map",
+        f"{audio_index}:a:0",
+        "-t",
+        str(duration),
+        "-r",
+        str(FPS),
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "22",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        "-movflags",
+        "+faststart",
+        "-shortest",
+        str(output_path)
+    ]
+
+    # Renderização.
+    result = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE
+    )
+
+    if result.returncode != 0:
+
+        error = result.stderr.decode(
+            "utf-8",
+            errors="replace"
+        )
+
+        raise RuntimeError(
+            "O FFmpeg falhou durante a renderização.\n\n"
+            + error[-9000:]
+        )
+
+    if (
+        not output_path.exists()
+        or output_path.stat().st_size < 10000
+    ):
+        raise RuntimeError(
+            "O vídeo não foi criado corretamente."
+        )
+
+    return output_path
+
+
+# ============================================================
+# INTERFACE DE ENTRADA
+# ============================================================
+
+st.subheader("1. Música")
+
+audio_upload = st.file_uploader(
+    "Envie a música",
+    type=[
+        "mp3",
+        "wav",
+        "m4a",
+        "aac",
+        "flac",
+        "ogg"
+    ],
+    help="A música será usada para gerar a sincronização das letras."
+)
+
+st.subheader("2. Fundo visual — opcional")
+
+background_upload = st.file_uploader(
+    "Envie um vídeo de show, cantor ou outro fundo",
+    type=[
+        "mp4",
+        "mov",
+        "m4v",
+        "webm"
+    ],
+    help=(
+        "Opcional. Se você não enviar nada, "
+        "a IA cria um fundo abstrato original."
+    )
+)
+
+rights_confirmed = False
+
+if background_upload:
+
+    rights_confirmed = st.checkbox(
+        "Confirmo que tenho autorização/direito de utilizar "
+        "o vídeo enviado como fundo."
+    )
+
+st.subheader("3. Letras")
+
+lyrics_mode = st.radio(
+    "Como deseja obter a letra?",
+    [
+        "IA transcreve automaticamente",
+        "Eu vou fornecer a letra"
+    ],
+    horizontal=False
+)
+
+manual_lyrics = ""
+
+if lyrics_mode == "Eu vou fornecer a letra":
+
+    manual_lyrics = st.text_area(
+        "Cole a letra aqui",
+        height=220,
+        placeholder=(
+            "Uma frase por linha.\n\n"
+            "Exemplo:\n"
+            "Primeira frase da música\n"
+            "Segunda frase da música\n"
+            "Terceira frase da música"
+        )
+    )
+
+st.subheader("4. Inteligência da transcrição")
+
+model_choice = st.selectbox(
+    "Modelo",
+    [
+        "tiny",
+        "base"
+    ],
+    index=0,
+    help=(
+        "tiny é mais rápido e recomendado para o primeiro teste. "
+        "base tende a transcrever melhor, mas demora mais."
+    )
+)
+
+st.subheader("5. Estilo")
+
+st.info(
+    "A seleção visual é automática. "
+    "O sistema decide fonte, tamanho, posição, "
+    "destaques e intensidade de acordo com cada trecho."
+)
+
+generate = st.button(
+    "🚀 CRIAR LYRIC VIDEO",
+    type="primary"
+)
+
+
+# ============================================================
+# EXECUÇÃO
+# ============================================================
+
+if generate:
+
+    if audio_upload is None and background_upload is None:
+
+        st.error(
+            "Envie pelo menos a música ou um vídeo contendo a música."
+        )
+
+        st.stop()
+
+    if background_upload and not rights_confirmed:
+
+        st.error(
+            "Para usar um vídeo enviado como fundo, "
+            "confirme que você tem autorização para utilizá-lo."
+        )
+
+        st.stop()
+
+    session_dir = (
+        TEMP_ROOT
+        / next(
+            tempfile._get_candidate_names()
+        )
+    )
+
+    session_dir.mkdir(
+        parents=True,
+        exist_ok=True
+    )
 
     try:
 
-        for index, phrase in enumerate(
-            phrases
-        ):
+        # ----------------------------------------------------
+        # Salvar uploads
+        # ----------------------------------------------------
 
-            start = max(
-                0,
-                phrase["start"],
+        with st.status(
+            "Preparando os arquivos...",
+            expanded=True
+        ) as status:
+
+            st.write(
+                "📦 Salvando arquivos..."
             )
 
-            end = min(
-                duration,
-                phrase["end"],
-            )
+            audio_path = None
+            background_path = None
 
-            length = end - start
+            if audio_upload:
 
-            if length <= 0:
-                continue
-
-            impact = phrase[
-                "impact"
-            ]
-
-            energy = phrase[
-                "energy"
-            ]
-
-            beat = phrase[
-                "beat"
-            ]
-
-            # =================================================
-            # ESCOLHA AUTÔNOMA DA FONTE
-            # =================================================
-
-            selected_font, font_name = (
-                choose_font(
-                    phrase,
-                    energy,
-                    impact,
-                    beat,
-                    index,
-                    library,
-                )
-            )
-
-            # =================================================
-            # TAMANHO
-            # =================================================
-
-            font_size = int(
-                64
-                + impact * 28
-            )
-
-            if len(
-                phrase["text"]
-            ) > 36:
-
-                font_size -= 8
-
-            font_size = max(
-                48,
-                font_size,
-            )
-
-            # =================================================
-            # COR
-            # =================================================
-
-            light = (
-                index % 5 == 3
-                and impact < 0.60
-            )
-
-            if light:
-
-                text_color = (
-                    10,
-                    10,
-                    10,
+                audio_original = save_uploaded_file(
+                    audio_upload,
+                    session_dir,
+                    "input_audio"
+                    + Path(
+                        audio_upload.name
+                    ).suffix
                 )
 
-                bg_color = (
-                    245,
-                    245,
-                    245,
+                audio_path = (
+                    session_dir
+                    / "audio.wav"
                 )
 
-                layers.append(
-                    ColorClip(
-                        size=(
-                            WIDTH,
-                            HEIGHT,
-                        ),
-                        color=bg_color,
+                normalize_audio(
+                    audio_original,
+                    audio_path
+                )
+
+            if background_upload:
+
+                background_path = save_uploaded_file(
+                    background_upload,
+                    session_dir,
+                    "background"
+                    + Path(
+                        background_upload.name
+                    ).suffix
+                )
+
+            # ------------------------------------------------
+            # Se só veio vídeo, extrair áudio.
+            # ------------------------------------------------
+
+            if (
+                audio_path is None
+                and background_path is not None
+            ):
+
+                audio_path = (
+                    session_dir
+                    / "audio.wav"
+                )
+
+                st.write(
+                    "🎧 Extraindo áudio do vídeo..."
+                )
+
+                extract_audio_from_video(
+                    background_path,
+                    audio_path
+                )
+
+            duration = ffprobe_duration(
+                audio_path
+            )
+
+            st.write(
+                f"⏱️ Duração detectada: "
+                f"{duration:.1f} segundos"
+            )
+
+            # ------------------------------------------------
+            # Energia
+            # ------------------------------------------------
+
+            st.write(
+                "🎚️ Analisando intensidade da música..."
+            )
+
+            energy = calculate_audio_energy(
+                audio_path
+            )
+
+            # ------------------------------------------------
+            # Letras
+            # ------------------------------------------------
+
+            if (
+                lyrics_mode
+                == "Eu vou fornecer a letra"
+            ):
+
+                if not manual_lyrics.strip():
+
+                    raise RuntimeError(
+                        "Você escolheu fornecer a letra, "
+                        "mas não colocou nenhum texto."
                     )
-                    .with_start(
-                        start
-                    )
-                    .with_duration(
-                        length
+
+                st.write(
+                    "📝 Organizando a letra fornecida..."
+                )
+
+                phrases = (
+                    create_phrases_from_manual_lyrics(
+                        manual_lyrics,
+                        duration,
+                        energy
                     )
                 )
 
             else:
 
-                text_color = (
-                    255,
-                    255,
-                    255,
+                st.write(
+                    "🤖 Transcrevendo a música..."
                 )
 
-            # =================================================
-            # VÍDEO DO CANTOR
-            # =================================================
-
-            if (
-                show_clip is not None
-                and (
-                    impact >= 0.72
-                    or (
-                        beat >= 0.70
-                        and index % 3 == 0
-                    )
-                )
-            ):
-
-                show_duration = (
-                    show_clip.duration
+                words, info = transcribe_audio(
+                    audio_path,
+                    model_choice
                 )
 
-                if show_duration > 0:
+                if not words:
 
-                    show_start = (
-                        start
-                        % show_duration
+                    raise RuntimeError(
+                        "A IA não encontrou palavras "
+                        "suficientes na música. "
+                        "Tente o modelo 'base' ou forneça "
+                        "a letra manualmente."
                     )
 
-                    show_end = min(
-                        show_start
-                        + length,
-                        show_duration,
-                    )
-
-                    if (
-                        show_end
-                        > show_start
-                    ):
-
-                        live = (
-                            show_clip
-                            .subclipped(
-                                show_start,
-                                show_end,
-                            )
-                            .resized(
-                                height=HEIGHT
-                            )
-                        )
-
-                        if live.w < WIDTH:
-
-                            live = (
-                                live
-                                .resized(
-                                    width=WIDTH
-                                )
-                            )
-
-                        if (
-                            live.w
-                            >= WIDTH
-                            and live.h
-                            >= HEIGHT
-                        ):
-
-                            live = (
-                                live
-                                .cropped(
-                                    x_center=(
-                                        live.w / 2
-                                    ),
-                                    y_center=(
-                                        live.h / 2
-                                    ),
-                                    width=WIDTH,
-                                    height=HEIGHT,
-                                )
-                            )
-
-                            live = (
-                                live
-                                .with_start(
-                                    start
-                                )
-                            )
-
-                            layers.append(
-                                live
-                            )
-
-            # =================================================
-            # TEXTO
-            # =================================================
-
-            image = make_text_image(
-                phrase["text"],
-                selected_font,
-                font_size,
-                text_color,
-            )
-
-            text_clip = (
-                ImageClip(
-                    image,
-                    transparent=True,
+                phrases = create_phrases(
+                    words,
+                    energy
                 )
-                .with_start(
-                    start
+
+            if not phrases:
+
+                raise RuntimeError(
+                    "Nenhuma frase foi criada."
                 )
-                .with_duration(
-                    length
-                )
+
+            st.write(
+                f"📝 {len(phrases)} frases detectadas."
             )
 
-            # =================================================
-            # FADE AUTOMÁTICO
-            # =================================================
+            # ------------------------------------------------
+            # Renderização
+            # ------------------------------------------------
 
-            fade = np.clip(
-                0.20
-                - impact * 0.10,
-                0.06,
-                0.20,
+            st.write(
+                "🎨 Construindo estilo visual automaticamente..."
             )
 
-            fade = min(
-                fade,
-                length / 3,
+            output_path = (
+                session_dir
+                / "lyric_video.mp4"
             )
 
-            text_clip = (
-                text_clip
-                .with_effects(
-                    [
-                        vfx.CrossFadeIn(
-                            fade
-                        ),
-                        vfx.CrossFadeOut(
-                            fade
-                        ),
-                    ]
-                )
+            st.write(
+                "🎬 Renderizando vídeo..."
             )
 
-            layers.append(
-                text_clip
+            render_video(
+                audio_path,
+                background_path,
+                phrases,
+                session_dir,
+                output_path
             )
 
-        # =====================================================
-        # COMPOSIÇÃO
-        # =====================================================
+            status.update(
+                label="Vídeo criado com sucesso!",
+                state="complete",
+                expanded=False
+            )
 
-        final = CompositeVideoClip(
-            layers,
-            size=(
-                WIDTH,
-                HEIGHT,
-            ),
+        # ----------------------------------------------------
+        # RESULTADO
+        # ----------------------------------------------------
+
+        st.success(
+            "🎉 Seu lyric video está pronto!"
         )
 
-        final = final.with_audio(
-            audio_clip
+        st.subheader(
+            "▶️ Resultado"
         )
 
-        final.write_videofile(
-            str(output_path),
-            fps=30,
-            codec="libx264",
-            audio_codec="aac",
-            preset="ultrafast",
-            threads=2,
-            logger=None,
+        st.video(
+            str(output_path)
         )
 
-        final.close()
+        with open(
+            output_path,
+            "rb"
+        ) as video_file:
+
+            video_bytes = video_file.read()
+
+        filename = (
+            safe_filename(
+                audio_upload.name
+                if audio_upload
+                else background_upload.name
+            )
+            + "_LYRIC_AI.mp4"
+        )
+
+        st.download_button(
+            label="⬇️ BAIXAR VÍDEO MP4",
+            data=video_bytes,
+            file_name=filename,
+            mime="video/mp4",
+            type="primary"
+        )
+
+        # ----------------------------------------------------
+        # RELATÓRIO
+        # ----------------------------------------------------
+
+        st.divider()
+
+        st.subheader(
+            "🧠 Decisões da IA"
+        )
+
+        st.write(
+            f"• Frases: **{len(phrases)}**"
+        )
+
+        st.write(
+            "• Formato: **9:16 / 1080×1920**"
+        )
+
+        st.write(
+            "• Sincronização: **automática**"
+        )
+
+        st.write(
+            "• Fonte: **selecionada automaticamente**"
+        )
+
+        st.write(
+            "• Animações: **fade + movimento + escala sutil**"
+        )
+
+        st.write(
+            "• Fundo: "
+            + (
+                "**vídeo enviado pelo usuário**"
+                if background_path
+                else "**gerado automaticamente**"
+            )
+        )
+
+        st.caption(
+            "A versão atual não busca imagens ou vídeos "
+            "de terceiros automaticamente. "
+            "Quando nenhum fundo é fornecido, "
+            "o visual é criado pelo próprio programa."
+        )
+
+    except Exception as error:
+
+        st.error(
+            "❌ A geração falhou."
+        )
+
+        with st.expander(
+            "Ver detalhes técnicos"
+        ):
+
+            st.code(
+                str(error),
+                language="text"
+            )
+
+        st.warning(
+            "Se aparecer um erro aqui, envie-me "
+            "uma captura dessa tela. A próxima correção "
+            "será feita em cima do erro real."
+        )
 
     finally:
 
-        if show_clip:
-
-            show_clip.close()
-
-        audio_clip.close()
-
-
-# ============================================================
-# INTERFACE
-# ============================================================
-
-st.title(
-    "🎵 Lyric AI"
-)
-
-st.caption(
-    "Seu gerador automático de lyric videos."
-)
-
-music = st.file_uploader(
-    "🎵 Música ou vídeo com áudio",
-    type=[
-        "mp3",
-        "wav",
-        "m4a",
-        "mp4",
-        "mov",
-        "webm",
-    ],
-)
-
-show = st.file_uploader(
-    "🎤 Vídeo do cantor/show — opcional",
-    type=[
-        "mp4",
-        "mov",
-        "webm",
-        "m4v",
-    ],
-)
-
-references = st.file_uploader(
-    "🎞️ Vídeos de referência — opcional",
-    type=[
-        "mp4",
-        "mov",
-        "webm",
-        "m4v",
-    ],
-    accept_multiple_files=True,
-)
-
-model = st.selectbox(
-    "🧠 Modelo de transcrição",
-    [
-        "base",
-        "small",
-        "tiny",
-    ],
-    index=0,
-)
-
-
-# ============================================================
-# BIBLIOTECA DE FONTES
-# ============================================================
-
-try:
-
-    font_library = get_font_library()
-
-except Exception as error:
-
-    st.error(
-        "Não consegui carregar a biblioteca "
-        "de fontes."
-    )
-
-    st.exception(
-        error
-    )
-
-    st.stop()
-
-
-# ============================================================
-# MOSTRAR FONTES DETECTADAS
-# ============================================================
-
-with st.expander(
-    "🔤 Biblioteca tipográfica da IA",
-    expanded=False,
-):
-
-    st.write(
-        "A IA escolhe automaticamente entre "
-        "as fontes disponíveis."
-    )
-
-    st.write(
-        "Fontes carregadas:"
-    )
-
-    st.write(
-        ", ".join(
-            sorted(
-                font_library.keys()
-            )
-        )
-    )
-
-
-# ============================================================
-# GERAR
-# ============================================================
-
-if st.button(
-    "🚀 CRIAR LYRIC VIDEO",
-    type="primary",
-    use_container_width=True,
-):
-
-    if not music:
-
-        st.error(
-            "🎵 Envie uma música primeiro."
-        )
-
-        st.stop()
-
-    with st.status(
-        "🎬 Criando seu lyric video...",
-        expanded=True,
-    ) as status:
-
-        try:
-
-            from moviepy import (
-                VideoFileClip
-            )
-
-            with tempfile.TemporaryDirectory() as temp:
-
-                directory = Path(
-                    temp
-                )
-
-                # ---------------------------------------------
-                # MÚSICA
-                # ---------------------------------------------
-
-                music_path = save_upload(
-                    music,
-                    directory,
-                    "music",
-                )
-
-                # ---------------------------------------------
-                # SHOW
-                # ---------------------------------------------
-
-                show_path = None
-
-                if show:
-
-                    show_path = save_upload(
-                        show,
-                        directory,
-                        "show",
-                    )
-
-                # ---------------------------------------------
-                # ÁUDIO
-                # ---------------------------------------------
-
-                audio_path = (
-                    music_path
-                )
-
-                if music_path.suffix.lower() in {
-                    ".mp4",
-                    ".mov",
-                    ".webm",
-                    ".m4v",
-                }:
-
-                    status.write(
-                        "🎧 Extraindo áudio..."
-                    )
-
-                    video = (
-                        VideoFileClip(
-                            str(
-                                music_path
-                            )
-                        )
-                    )
-
-                    if video.audio is None:
-
-                        video.close()
-
-                        raise RuntimeError(
-                            "O vídeo não possui áudio."
-                        )
-
-                    audio_path = (
-                        directory
-                        / "audio.wav"
-                    )
-
-                    video.audio.write_audiofile(
-                        str(
-                            audio_path
-                        ),
-                        logger=None,
-                    )
-
-                    video.close()
-
-                # ---------------------------------------------
-                # ÁUDIO
-                # ---------------------------------------------
-
-                status.write(
-                    "🥁 Analisando música..."
-                )
-
-                audio = analyze_audio(
-                    str(
-                        audio_path
-                    )
-                )
-
-                status.write(
-                    f"✓ BPM estimado: "
-                    f"{audio['tempo']:.1f}"
-                )
-
-                # ---------------------------------------------
-                # TRANSCRIÇÃO
-                # ---------------------------------------------
-
-                status.write(
-                    "🗣️ Transcrevendo letra..."
-                )
-
-                words, language = (
-                    transcribe(
-                        str(
-                            audio_path
-                        ),
-                        model,
-                    )
-                )
-
-                status.write(
-                    f"✓ {len(words)} palavras "
-                    f"identificadas."
-                )
-
-                # ---------------------------------------------
-                # FRASES
-                # ---------------------------------------------
-
-                status.write(
-                    "✂️ Criando cortes inteligentes..."
-                )
-
-                phrases = group_words(
-                    words
-                )
-
-                phrases = score_phrases(
-                    phrases,
-                    audio,
-                )
-
-                # ---------------------------------------------
-                # FONTES
-                # ---------------------------------------------
-
-                status.write(
-                    "🔤 A IA está escolhendo "
-                    "a tipografia de cada trecho..."
-                )
-
-                # ---------------------------------------------
-                # RENDER
-                # ---------------------------------------------
-
-                output = (
-                    directory
-                    / "lyric_ai.mp4"
-                )
-
-                status.write(
-                    "🎬 Renderizando vídeo 9:16..."
-                )
-
-                render_video(
-                    audio_path,
-                    show_path,
-                    phrases,
-                    audio,
-                    font_library,
-                    output,
-                )
-
-                # ---------------------------------------------
-                # GUARDAR
-                # ---------------------------------------------
-
-                st.session_state.result_video = (
-                    output.read_bytes()
-                )
-
-            status.update(
-                label="✅ Vídeo pronto!",
-                state="complete",
-                expanded=False,
-            )
-
-        except Exception as error:
-
-            status.update(
-                label="❌ A geração falhou",
-                state="error",
-                expanded=True,
-            )
-
-            st.error(
-                str(error)
-            )
-
-            st.exception(
-                error
-            )
-
-            st.session_state.result_video = None
-
-
-# ============================================================
-# RESULTADO
-# ============================================================
-
-if st.session_state.result_video:
-
-    st.divider()
-
-    st.header(
-        "🎬 Resultado"
-    )
-
-    st.video(
-        st.session_state.result_video
-    )
-
-    st.download_button(
-        "⬇️ SALVAR VÍDEO",
-        st.session_state.result_video,
-        "lyric_ai.mp4",
-        "video/mp4",
-        use_container_width=True,
-    )
+        # Mantém o resultado durante a sessão.
+        # Não apagamos imediatamente os arquivos.
+        pass
