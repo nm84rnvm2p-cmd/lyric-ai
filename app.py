@@ -1,5 +1,4 @@
-
-import os, re, math, json, time, shutil, subprocess, tempfile, urllib.request, hashlib
+import os, re, math, json, time, shutil, subprocess, tempfile, urllib.request, hashlib, difflib, unicodedata
 from pathlib import Path
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Dict
@@ -13,8 +12,8 @@ from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageEnhance
 # Python 3.12 / Streamlit
 # ============================================================
 
-APP_VERSION = "4.0-EDITORIAL"
-W, H = 720, 1280          # reliable default; can be switched to 1080x1920
+APP_VERSION = "6.0-PHRASE-WORD-SYNC"
+W, H = 1080, 1920          # high-quality vertical default
 FPS = 30
 CACHE_DIR = Path(".lyric_cache")
 FONT_DIR = CACHE_DIR / "fonts"
@@ -84,20 +83,19 @@ def normalize_text(s: str) -> str:
     return s
 
 def words_from_manual_lyrics(text: str, duration: float) -> List[dict]:
-    """Fallback when user provides lyrics. Timings are estimated proportionally."""
-    raw = re.findall(r"\S+", normalize_text(text))
+    """Last-resort fallback only. Without ASR timestamps there is no way to know
+    the exact singing moment, so this keeps the text usable rather than failing."""
+    lines = [normalize_text(x) for x in (text or '').splitlines() if normalize_text(x)]
+    raw = [tok for line in lines for tok in re.findall(r"\S+", line)]
     if not raw:
         return []
-    # Slightly longer duration for longer words; normalized.
     weights = np.array([max(1.0, len(re.sub(r"[^\wÀ-ÿ]", "", x)))**0.75 for x in raw], dtype=float)
-    weights /= weights.sum()
-    cur = 0.0
-    out = []
-    for i, (tok, wt) in enumerate(zip(raw, weights)):
-        start = cur
-        end = duration * float(cur + wt)
-        out.append({"word": tok, "start": start, "end": max(start+0.08, end), "prob": 1.0})
-        cur = end
+    weights /= max(weights.sum(), 1.0)
+    out=[]; cur=0.0
+    for i,(tok,wt) in enumerate(zip(raw,weights)):
+        st=cur; en=duration*(cur+float(wt))
+        out.append({"word":tok,"start":st,"end":max(st+0.07,en),"prob":0.4,"phrase_id":i})
+        cur=en
     return out
 
 def get_ffmpeg() -> str:
@@ -209,7 +207,7 @@ def get_whisper(model_name: str):
 def transcribe_audio(path: str, model_name: str, status=None) -> Tuple[List[dict], str, float]:
     model = get_whisper(model_name)
     if status:
-        status.write(f"Transcrevendo com **{model_name}**…")
+        status.write(f"Transcrevendo com **{model_name}** com timestamps por palavra…")
     segments, info = model.transcribe(
         path,
         language="pt",
@@ -217,15 +215,15 @@ def transcribe_audio(path: str, model_name: str, status=None) -> Tuple[List[dict
         beam_size=5,
         best_of=5,
         patience=1.0,
-        temperature=[0.0, 0.2, 0.4],
+        temperature=0.0,
         condition_on_previous_text=True,
-        vad_filter=True,
-        vad_parameters=dict(min_silence_duration_ms=350, speech_pad_ms=180),
+        # Música cantada pode ser confundida com silêncio pelo VAD.
+        # Desativá-lo evita que versos inteiros desapareçam.
+        vad_filter=False,
         word_timestamps=True,
         initial_prompt=(
-            "Transcrição de música sertaneja brasileira em português. "
-            "Preserve palavras, repetições, gírias e contrações. "
-            "Não traduza. Não invente palavras."
+            "Letra de música brasileira em português. Preserve exatamente palavras, "
+            "repetições, gírias, contrações e nomes próprios. Não traduza e não resuma."
         ),
     )
     words = []
@@ -243,6 +241,116 @@ def transcribe_audio(path: str, model_name: str, status=None) -> Tuple[List[dict
                 "prob": float(getattr(w, "probability", 0.0) or 0.0),
             })
     return words, getattr(info, "language", "pt"), float(getattr(info, "duration", 0.0) or 0.0)
+
+
+def _norm_token(x: str) -> str:
+    x = unicodedata.normalize("NFKD", x or "")
+    x = "".join(c for c in x if not unicodedata.combining(c))
+    return re.sub(r"[^a-zA-Z0-9]", "", x).lower()
+
+def _token_similarity(a: str, b: str) -> float:
+    a=_norm_token(a); b=_norm_token(b)
+    if not a or not b: return 0.0
+    if a==b: return 1.0
+    if a in b or b in a: return 0.88
+    return difflib.SequenceMatcher(None,a,b,autojunk=False).ratio()
+
+def align_manual_lyrics(manual_text: str, asr_words: List[dict], duration: float) -> List[dict]:
+    """Align the user's official lyric to REAL Whisper word timestamps.
+
+    The previous version used a global SequenceMatcher and then interpolated large
+    unmatched runs. That could create absurdly sparse timings. This version performs
+    monotonic fuzzy matching token-by-token and keeps each lyric line as a phrase.
+    Thus the displayed text is authoritative while the singer's actual timing remains
+    authoritative for animation.
+    """
+    raw_lines=[normalize_text(x) for x in (manual_text or '').splitlines() if normalize_text(x)]
+    if not raw_lines:
+        return []
+    if not asr_words:
+        return words_from_manual_lyrics(manual_text,duration)
+
+    out=[]; cursor=0; n=len(asr_words)
+    for phrase_id,line in enumerate(raw_lines):
+        toks=re.findall(r"\S+",line)
+        if not toks: continue
+        mapped=[]
+        search_start=cursor
+        for tok in toks:
+            best_idx=None; best_score=0.0
+            # Search a generous but monotonic window. This tolerates Whisper spelling
+            # differences without ever jumping backwards in the song.
+            upper=min(n,search_start+24)
+            for j in range(search_start,upper):
+                score=_token_similarity(tok,asr_words[j]["word"])
+                if score>best_score:
+                    best_score=score; best_idx=j
+                if score>=0.995:
+                    break
+            if best_idx is not None and best_score>=0.58:
+                mapped.append((tok,best_idx,best_score))
+                search_start=best_idx+1
+        if mapped:
+            first_idx=mapped[0][1]; last_idx=mapped[-1][1]
+            phrase_start=float(asr_words[first_idx]["start"])
+            phrase_end=float(asr_words[last_idx]["end"])
+            # Use the full ASR span for this phrase when possible.
+            cursor=last_idx+1
+        else:
+            # No reliable match: place this phrase between surrounding ASR material.
+            phrase_start=float(asr_words[min(cursor,n-1)]["start"]) if cursor<n else duration
+            phrase_end=min(duration,phrase_start+max(0.4,0.18*len(toks)))
+
+        # Build individual word timestamps. Known tokens inherit exact ASR times.
+        known={m[0]:[] for m in mapped}
+        # Duplicate words need ordered assignment, so map by token position.
+        pos_map={}
+        for tok,idx,score in mapped:
+            pos_map.setdefault(tok,[]).append((idx,score))
+        mapped_positions=[]
+        used=0
+        for tok in toks:
+            candidates=pos_map.get(tok,[])
+            if candidates:
+                idx,score=candidates.pop(0); mapped_positions.append((idx,score))
+            else:
+                mapped_positions.append(None)
+
+        known_pairs=[(i,m[0],m[1]) for i,m in enumerate(mapped_positions) if m is not None]
+        # Phrase boundaries are expanded slightly, but word timestamps remain exact.
+        for i,tok in enumerate(toks):
+            if mapped_positions[i] is not None:
+                idx,score=mapped_positions[i]
+                st=float(asr_words[idx]["start"]); en=float(asr_words[idx]["end"])
+                prob=max(float(asr_words[idx].get("prob",0.0)),float(score)*0.75)
+            else:
+                # Interpolate only inside this lyric line, never across the entire song.
+                prev=[x for x in known_pairs if x[0]<i]
+                nxt=[x for x in known_pairs if x[0]>i]
+                if prev:
+                    pi,pm,_=prev[-1]; base=float(asr_words[pm]["end"])
+                else:
+                    pi=-1; base=phrase_start
+                if nxt:
+                    ni,nm,_=nxt[0]; target=float(asr_words[nm]["start"])
+                else:
+                    ni=len(toks); target=phrase_end
+                gap=max(0.12,target-base)
+                frac=(i-pi)/max(1,ni-pi)
+                st=base+gap*max(0.0,frac-1/max(1,ni-pi))
+                en=base+gap*frac
+                st=max(phrase_start,st); en=max(st+0.055,min(phrase_end,en))
+                prob=0.5
+            out.append({"word":tok,"start":max(0.0,st),"end":max(st+0.055,en),"prob":prob,"phrase_id":phrase_id,"phrase_text":line})
+
+    # Enforce strict monotonicity while preserving real timestamps as much as possible.
+    out.sort(key=lambda x:(x.get("phrase_id",0),x["start"]))
+    prev=0.0
+    for w in out:
+        w["start"]=max(prev,float(w["start"]))
+        w["end"]=max(w["start"]+0.055,float(w["end"]))
+        prev=w["start"]
+    return out
 
 # ---------- audio / structure analysis ----------
 
@@ -304,40 +412,41 @@ def clean_transcription(words: List[dict]) -> List[dict]:
         prev = w["end"]
     return out
 
-def segment_lyrics(words: List[dict], max_words=7, max_seconds=4.2) -> List[dict]:
-    if not words:
-        return []
-    scenes = []
-    cur = []
+def segment_lyrics(words: List[dict], max_words=18, max_seconds=8.5) -> List[dict]:
+    """Create visual phrases. Manual lyric lines stay together; automatic mode
+    changes phrase only after a real singing pause/punctuation or a safety limit.
+    A phrase is intentionally NOT limited to 7 words: the words accumulate on the
+    same frame until the singer finishes the phrase."""
+    if not words: return []
+    scenes=[]; cur=[]
+    manual_mode=any("phrase_id" in w for w in words)
+    current_pid=None
     for w in words:
         if not cur:
-            cur = [w]
-            continue
-        gap = float(w["start"]) - float(cur[-1]["end"])
-        proposed = cur + [w]
-        duration = proposed[-1]["end"] - proposed[0]["start"]
-        # Hard boundaries: long pause, punctuation, or excessive length.
-        punctuation_break = bool(re.search(r"[.!?,;:]$", cur[-1]["word"]))
-        if gap > 0.75 or len(proposed) > max_words or duration > max_seconds or punctuation_break:
-            scenes.append(cur)
-            cur = [w]
+            cur=[w]; current_pid=w.get("phrase_id") if manual_mode else None; continue
+        if manual_mode and w.get("phrase_id")!=current_pid:
+            scenes.append(cur); cur=[w]; current_pid=w.get("phrase_id"); continue
+        gap=float(w["start"])-float(cur[-1]["end"])
+        punctuation=bool(re.search(r"[.!?;:]$",cur[-1]["word"]))
+        proposed=cur+[w]
+        too_long=len(proposed)>max_words or (proposed[-1]["end"]-proposed[0]["start"]>max_seconds)
+        # A gap is the primary automatic phrase boundary. A small gap still means
+        # the current phrase is being sung and should keep accumulating words.
+        if gap>0.72 or punctuation or too_long:
+            scenes.append(cur); cur=[w]
         else:
-            cur = proposed
-    if cur:
-        scenes.append(cur)
+            cur=proposed
+    if cur: scenes.append(cur)
 
-    result = []
-    for i, ws in enumerate(scenes):
-        start = ws[0]["start"]
-        end = ws[-1]["end"]
-        # Expand scene slightly to prevent flicker.
-        pre = 0.06 if i == 0 else min(0.08, max(0, start - scenes[i-1][-1]["end"]))
-        post = 0.08
-        result.append({
-            "words": ws,
-            "start": max(0, start-pre),
-            "end": end+post,
-        })
+    result=[]
+    for i,ws in enumerate(scenes):
+        st=float(ws[0]["start"]); en=float(ws[-1]["end"])
+        # For manual lines, never let the next line appear before the current one
+        # has had a natural release. For automatic phrases use a tiny breathing room.
+        pre=0.04 if i==0 else 0.02
+        post=0.16
+        result.append({"words":ws,"start":max(0.0,st-pre),"end":en+post,
+                       "instrumental":False,"phrase_text":" ".join(w["word"] for w in ws)})
     return result
 
 def ensure_coverage(scenes: List[dict], duration: float) -> List[dict]:
@@ -490,82 +599,139 @@ def highlight_words(draw, words, font, max_width, fg, accent, muted, style_kind=
         important.add(idx)
     return lines, important
 
+def _word_style_index(words, idx):
+    token = re.sub(r"[^\wÀ-ÿ]", "", words[idx]["word"].lower())
+    emotional = {"amor","saudade","beijo","coração","voce","você","eu","mim","nunca","sempre","volta","voltar","embora","ciúmes","perfume","vida","desejo","paixão","sofrer","chora","chorar","quero","meu","minha","tudo","nada"}
+    if token in emotional or len(token) >= 8:
+        return "accent"
+    return "normal"
+
+def _draw_word_animated(base, token, font, x, y, color, accent, progress, W, H, important=False):
+    """Kinetic word entrance: opacity + scale + upward motion + soft glow, without FFmpeg filters."""
+    p=clamp(progress,0,1)
+    e=ease_out(p)
+    scale=0.72+0.28*e
+    alpha=int(255*e)
+    box=font.getbbox(token)
+    tw=max(1,box[2]-box[0]); th=max(1,box[3]-box[1])
+    pad=28 if important else 18
+    layer=Image.new("RGBA",(tw+pad*2,th+pad*2),(0,0,0,0))
+    ld=ImageDraw.Draw(layer)
+    fill=accent if important else color
+    # glow only on impact words; subtle enough to remain editorial.
+    if important:
+        for sw,a in [(12,24),(7,34),(3,55)]:
+            ld.text((pad,pad),token,font=font,fill=fill+(a,),stroke_width=sw,stroke_fill=fill+(a,))
+    ld.text((pad,pad),token,font=font,fill=fill+(alpha,),stroke_width=1,stroke_fill=(0,0,0,min(100,alpha)))
+    if scale != 1:
+        layer=layer.resize((max(1,int(layer.width*scale)),max(1,int(layer.height*scale))),Image.Resampling.LANCZOS)
+    yy=int(y + (1-e)*24)
+    xx=int(x - (layer.width-tw-pad*2)/2)
+    base.alpha_composite(layer,(xx,yy))
+    return layer.width
+
 def render_scene_frame(scene, style, registry, W, H, t_local, duration, bg_img):
-    # scene-relative 0..duration
-    img = bg_img.convert("RGBA")
-    overlay = Image.new("RGBA",(W,H),(0,0,0,0))
-    d=ImageDraw.Draw(overlay)
+    """Render one phrase as accumulated kinetic typography.
+
+    Design rule: once a word is sung it remains visible. New words are added at their
+    exact timestamps. The entire phrase stays in one composition and disappears only
+    when the phrase ends. This is the intended lyric-video behavior.
+    """
+    img=bg_img.convert("RGBA")
+    overlay=Image.new("RGBA",(W,H),(0,0,0,0)); d=ImageDraw.Draw(overlay)
     words=scene.get("words",[])
-    text=" ".join(w["word"] for w in words)
-    if not text:
-        # instrumental: elegant micro motion / line.
-        prog=clamp(t_local/max(duration,0.01),0,1)
-        y=int(H*0.49+math.sin(t_local*1.1)*8)
-        d.line((W*.22,y,W*.78,y),fill=style.accent+(150,),width=2)
+    if not words:
+        p=clamp(t_local/max(duration,0.01),0,1)
+        cx=W/2+math.sin(t_local*.65)*W*.10; cy=H*.50+math.cos(t_local*.85)*H*.05
+        r=int(W*(.10+.045*math.sin(t_local*1.4)**2))
+        for k,(rr,aa) in enumerate([(r*2.1,20),(r*1.55,35),(r,80)]):
+            d.ellipse((cx-rr,cy-rr,cx+rr,cy+rr),outline=style.accent+(aa,),width=max(2,int(W*.0025)))
+        d.line((W*.12,H*.76,W*.88,H*.76),fill=style.accent+(100,),width=max(2,int(W*.002)))
         return Image.alpha_composite(img,overlay).convert("RGB")
 
-    # Entrance / exit
-    fade=0.18
-    a=255
-    if t_local<fade: a=int(255*ease_out(t_local/fade))
-    if duration-t_local<fade: a=int(255*ease_out((duration-t_local)/fade))
-    pulse=1.0+0.035*math.sin(math.pi*clamp(t_local/duration,0,1))
-    energy=0.55
+    # Only words whose actual singing start has arrived are visible. All prior words
+    # remain, so A -> A B -> A B C -> A B C D.
+    spoken=[]
+    for idx,w in enumerate(words):
+        rs=float(w["start"])-float(scene["start"])
+        if t_local>=rs-0.012:
+            spoken.append((idx,w,rs))
+    if not spoken:
+        return Image.alpha_composite(img,overlay).convert("RGB")
 
-    # Layout selected from reference language.
-    if style.layout=="hero" or len(words)<=2:
-        fpath=font_path(style.display_font,registry)
-        maxw=int(W*.90)
-        fs=int(H*.105 if len(text)<=8 else H*.075)
-        font=fit_font(text.upper(),maxw,fs,fpath)
-        tw,th=text_bbox(d,text.upper(),font)
-        scale=1.0
-        if t_local<0.28:
-            scale=lerp(1.10,1.0,ease_out(t_local/.28))
-        # Render on temp for scale/alpha.
-        tmp=Image.new("RGBA",(max(10,tw+80),max(10,th+80)),(0,0,0,0))
-        td=ImageDraw.Draw(tmp)
-        td.text((40,20),text.upper(),font=font,fill=style.fg+(a,),anchor=None)
-        if scale!=1:
-            tmp=tmp.resize((int(tmp.width*scale),int(tmp.height*scale)),Image.Resampling.LANCZOS)
-        x=(W-tmp.width)//2
-        y=int(H*.42-tmp.height/2)
-        overlay.alpha_composite(tmp,(x,y))
-        # small accent rule
-        d=ImageDraw.Draw(overlay)
-        linew=int(W*.18)
-        d.line(((W-linew)/2,H*.64,(W+linew)/2,H*.64),fill=style.accent+(min(a,190),),width=2)
-    else:
-        fpath=font_path(style.font,registry)
-        fs=int(H*.062 if len(words)<=5 else H*.050)
-        font=fit_font(text.upper(),int(W*.86),fs,fpath)
-        lines, important=highlight_words(d,words,font,int(W*.86),style.fg,style.accent,style.muted)
-        line_gap=int(font.size*.82)
-        total_h=line_gap*len(lines)
-        y=int(H*.5-total_h/2)
-        idx=0
-        for li,line in enumerate(lines):
-            tw,th=text_bbox(d,line.upper(),font)
-            x=(W-tw)/2
-            # Slight editorial vertical movement, not a cheesy slide.
-            yy=y+li*line_gap + int(math.sin(t_local*1.2+li)*3)
-            cursor=x
-            for token in line.split():
-                token_u=token.upper()
-                clean=re.sub(r"[^\wÀ-ÿ]","",token.lower())
-                # Match approximate word index.
-                color=style.fg
-                if idx in important:
-                    color=style.accent
-                    # impact word gets slightly larger by drawing a subtle halo.
-                # shadow only when background is video.
-                if style.shadow:
-                    d.text((cursor+2,yy+3),token_u,font=font,fill=(0,0,0,min(80,a)))
-                d.text((cursor,yy),token_u,font=font,fill=color+(a,))
-                ww=text_bbox(d,token_u,font)[0]
-                space=text_bbox(d," ",font)[0]
-                cursor += ww+space
-                idx+=1
+    # Scene atmosphere: layered glass/card, accent ring, moving light streaks.
+    pulse=0.5+0.5*math.sin(t_local*2.2)
+    d.rounded_rectangle((W*.055,H*.12,W*.945,H*.88),radius=int(W*.055),
+                        fill=(0,0,0,34),outline=style.accent+(42,),width=max(2,int(W*.002)))
+    d.line((W*.09,H*.20,W*(.25+.05*pulse),H*.20),fill=style.accent+(120,),width=max(3,int(W*.004)))
+    d.line((W*(.75-.05*pulse),H*.80,W*.91,H*.80),fill=style.accent+(90,),width=max(3,int(W*.004)))
+
+    # Decorative particles/geometry tied to the phrase, deliberately restrained.
+    seed=sum((i+1)*ord(c) for i,c in enumerate(scene.get("phrase_text","")))%997
+    for k in range(5):
+        ang=t_local*(.35+.07*k)+seed*.01+k
+        x=W*(.12+.76*((math.sin(ang)+1)/2)); y=H*(.18+.64*((math.cos(ang*1.13)+1)/2))
+        rr=int(W*(.004+.002*k)); d.ellipse((x-rr,y-rr,x+rr,y+rr),fill=style.accent+(35+k*8,))
+
+    fpath=font_path(style.font,registry)
+    display_path=font_path(style.display_font,registry)
+    # Fit the COMPLETE spoken phrase, not only the last seven words.
+    spoken_words=[x[1] for x in spoken]
+    text=" ".join(w["word"].upper() for w in spoken_words)
+    maxw=int(W*.80)
+    base_size=int(H*.068 if len(spoken_words)>7 else H*.078)
+    if style.layout=="hero" and len(spoken_words)<=4: base_size=int(H*.088)
+    font=fit_font(text,maxw,base_size,fpath)
+
+    # Wrap by real pixel width, preserving every spoken word.
+    rows=[]; row=[]; roww=0; space_w=text_bbox(d," ",font)[0]
+    for item in spoken:
+        token=item[1]["word"].upper(); ww=text_bbox(d,token,font)[0]
+        if row and roww+space_w+ww>maxw:
+            rows.append((row,roww)); row=[item]; roww=ww
+        else:
+            row.append(item); roww += ww if not roww else space_w+ww
+    if row: rows.append((row,roww))
+    line_gap=int(font.size*1.08); total_h=line_gap*len(rows)
+    y0=H*.50-total_h/2
+
+    newest_idx=spoken[-1][0]
+    for ri,(row,roww) in enumerate(rows):
+        cursor=(W-roww)/2
+        for item in row:
+            idx,w,rs=item; token=w["word"].upper()
+            ww=text_bbox(d,token,font)[0]
+            p=clamp((t_local-rs)/.20,0,1); e=ease_out(p)
+            important=_word_style_index(words,idx)=="accent"
+            # Every newly spoken word gets a brief accent pulse; important words get glow.
+            age=max(0,t_local-rs)
+            if idx==newest_idx and age<0.55:
+                pulse_amt=1.0+0.055*math.sin(age*18)*(1-age/0.55)
+            else: pulse_amt=1.0
+            col=style.accent if important or idx==newest_idx else style.fg
+            alpha=int(255*e)
+            # shadow + soft glow
+            if important or idx==newest_idx:
+                for sw,a in [(12,20),(7,30),(3,42)]:
+                    d.text((cursor+sw*.12,y0+ri*line_gap+sw*.18),token,font=font,
+                           fill=col+(a,),stroke_width=sw,stroke_fill=col+(a,))
+            # slight rise on entrance, then settle.
+            yy=y0+ri*line_gap+(1-e)*28
+            d.text((cursor,yy),token,font=font,fill=col+(alpha,),
+                   stroke_width=max(1,int(font.size*.012)),stroke_fill=(0,0,0,min(120,alpha)))
+            # Micro underline for the newest word.
+            if idx==newest_idx:
+                uw=max(8,int(ww*.65)); ux=cursor+(ww-uw)/2
+                ua=int(140*max(0,1-age/.65))
+                d.rounded_rectangle((ux,y0+ri*line_gap+font.size*1.02,ux+uw,
+                                     y0+ri*line_gap+font.size*1.02+max(3,int(font.size*.025))),
+                                    radius=4,fill=style.accent+(ua,))
+            cursor+=ww+space_w
+
+    # Phrase progress bar subtly communicates the current vocal passage.
+    frac=clamp(t_local/max(duration,.001),0,1)
+    barw=W*.68; d.rounded_rectangle(((W-barw)/2,H*.78,(W+barw)/2,H*.78+7),radius=4,fill=style.muted+(45,))
+    d.rounded_rectangle(((W-barw)/2,H*.78,(W-barw)/2+barw*frac,H*.78+7),radius=4,fill=style.accent+(150,))
     return Image.alpha_composite(img,overlay).convert("RGB")
 
 # ---------- background video reader ----------
@@ -607,82 +773,84 @@ def fit_crop_frame(frame, W,H):
 def render_video(audio_path, background_path, scenes, registry, style_theme,
                  out_path, resolution=(720,1280), fps=30, quality="Equilibrado",
                  progress=None):
+    """High-quality renderer. Frames are piped directly to FFmpeg as raw RGB,
+    avoiding the lossy OpenCV mp4v intermediate that caused visible softness."""
     import cv2
     W,H=resolution
     duration=media_duration(audio_path)
-    # If ffmpeg duration parsing is unavailable, use last lyric timestamp.
     if duration<=0 and scenes:
         duration=max(s["end"] for s in scenes)
-    bgcap=None
-    bginfo=None
-    bg_static=None
+    bgcap=None; bg_static=None
     if background_path:
-        bginfo=video_info(background_path)
-        if bginfo:
-            bgcap=cv2.VideoCapture(background_path)
+        info=video_info(background_path)
+        if info: bgcap=cv2.VideoCapture(background_path)
         else:
-            try:
-                bg_static=np.asarray(Image.open(background_path).convert("RGB"))
-            except Exception:
-                bg_static=None
+            try: bg_static=np.asarray(Image.open(background_path).convert("RGB"))
+            except Exception: bg_static=None
 
-    # Codec selection. mp4v is broadly available in OpenCV containers.
-    temp_video=Path(out_path).with_suffix(".silent.mp4")
-    fourcc=cv2.VideoWriter_fourcc(*"mp4v")
-    writer=cv2.VideoWriter(str(temp_video),fourcc,fps,(W,H))
-    if not writer.isOpened():
-        raise RuntimeError("Não foi possível abrir o renderizador de vídeo no ambiente.")
-
-    scene_i=0
-    total=max(1,int(math.ceil(duration*fps)))
-    # Quality can change the final size without changing design.
-    for frame_i in range(total):
-        t=frame_i/fps
-        while scene_i+1<len(scenes) and t>scenes[scene_i]["end"]:
-            scene_i+=1
-        scene=scenes[min(scene_i,len(scenes)-1)] if scenes else {"start":0,"end":duration,"words":[],"instrumental":True}
-        # Background frame
-        bgframe=None
-        if bgcap is not None:
-            bgcap.set(cv2.CAP_PROP_POS_MSEC,t*1000)
-            ok,fr=bgcap.read()
-            if ok:
-                bgframe=fit_crop_frame(fr,W,H)
-        elif bg_static is not None:
-            bgframe=fit_crop_frame(bg_static,W,H)
-        style=choose_style(scene,FEATURES_GLOBAL,registry,seed=scene_i,global_theme=style_theme)
-        bg=make_background((W,H),style,t,background_frame=bgframe)
-        local=clamp(t-scene["start"],0,max(0.001,scene["end"]-scene["start"]))
-        final=render_scene_frame(scene,style,registry,W,H,local,scene["end"]-scene["start"],bg)
-        writer.write(cv2.cvtColor(np.asarray(final),cv2.COLOR_RGB2BGR))
-        if progress and frame_i%max(1,fps)==0:
-            progress.progress(min(0.92,frame_i/total*0.92), text=f"Renderizando {int(frame_i/total*100)}%")
-    writer.release()
-    if bgcap: bgcap.release()
-
-    # Mux original audio. Re-encode video to H.264 for mobile compatibility.
     ff=get_ffmpeg()
-    cmd=[
-        ff,"-y","-i",str(temp_video),"-i",audio_path,
-        "-map","0:v:0","-map","1:a:0",
-        "-c:v","libx264","-preset","veryfast","-crf","19",
-        "-pix_fmt","yuv420p","-movflags","+faststart",
-        "-c:a","aac","-b:a","192k","-shortest",str(out_path)
-    ]
+    silent=Path(out_path).with_suffix('.silent.mp4')
+    crf='14' if quality=="Alta qualidade" else '17'
+    preset='slow' if quality=="Alta qualidade" else 'medium'
+    enc=[ff,'-y','-f','rawvideo','-vcodec','rawvideo','-pix_fmt','rgb24',
+         '-s',f'{W}x{H}','-r',str(fps),'-i','-',
+         '-an','-c:v','libx264','-preset',preset,'-crf',crf,
+         '-pix_fmt','yuv420p','-movflags','+faststart',str(silent)]
+    proc=subprocess.Popen(enc,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+    scene_i=0; total=max(1,int(math.ceil(duration*fps)))
+    try:
+        for frame_i in range(total):
+            t=frame_i/fps
+            while scene_i+1<len(scenes) and t>scenes[scene_i]["end"]: scene_i+=1
+            scene=scenes[min(scene_i,len(scenes)-1)] if scenes else {"start":0,"end":duration,"words":[],"instrumental":True}
+            bgframe=None
+            if bgcap is not None:
+                # Sequential-ish seeking is still used for arbitrary input length;
+                # OpenCV handles the decode while our typography stays deterministic.
+                bgcap.set(cv2.CAP_PROP_POS_MSEC,t*1000); ok,fr=bgcap.read()
+                if ok: bgframe=fit_crop_frame(fr,W,H)
+            elif bg_static is not None:
+                bgframe=fit_crop_frame(bg_static,W,H)
+            style=choose_style(scene,FEATURES_GLOBAL,registry,seed=scene_i,global_theme=style_theme)
+            bg=make_background((W,H),style,t,background_frame=bgframe)
+            local=clamp(t-scene["start"],0,max(.001,scene["end"]-scene["start"]))
+            scene_dur=max(.001,scene["end"]-scene["start"])
+            final=render_scene_frame(scene,style,registry,W,H,local,scene_dur,bg)
+            if scene_i>0 and 0<=t-scene["start"]<0.28:
+                prev=scenes[scene_i-1]
+                ps=choose_style(prev,FEATURES_GLOBAL,registry,seed=scene_i-1,global_theme=style_theme)
+                pd=max(.001,prev["end"]-prev["start"])
+                pb=make_background((W,H),ps,max(0,t-.02),background_frame=bgframe)
+                outgoing=render_scene_frame(prev,ps,registry,W,H,pd,pd,pb)
+                tr=ease_in_out(clamp((t-scene["start"])/.28,0,1))
+                final=Image.blend(outgoing,final,tr)
+            frame=np.asarray(final.convert('RGB'),dtype=np.uint8)
+            proc.stdin.write(frame.tobytes())
+            if progress and frame_i%max(1,fps)==0:
+                progress.progress(min(.92,frame_i/total*.92),text=f"Renderizando {int(frame_i/total*100)}%")
+        proc.stdin.close(); proc.stdin=None
+        stderr=proc.stderr.read().decode('utf-8','replace')
+        code=proc.wait()
+        if code!=0:
+            raise RuntimeError('FFmpeg não conseguiu codificar o vídeo em H.264.\n'+stderr[-5000:])
+    except BrokenPipeError:
+        try: proc.stdin.close()
+        except Exception: pass
+        err=proc.stderr.read().decode('utf-8','replace')
+        proc.wait()
+        raise RuntimeError('O FFmpeg encerrou durante a renderização.\n'+err[-5000:])
+    finally:
+        if bgcap: bgcap.release()
+
+    # Add original audio without re-encoding the already high-quality video.
+    cmd=[ff,'-y','-i',str(silent),'-i',audio_path,
+         '-map','0:v:0','-map','1:a:0','-c:v','copy',
+         '-c:a','aac','-b:a','256k','-shortest','-movflags','+faststart',str(out_path)]
     try:
         run_cmd(cmd,timeout=max(180,int(duration*8)))
-    except Exception:
-        # Some builds do not expose libx264; fallback to MPEG-4.
-        cmd2=[
-            ff,"-y","-i",str(temp_video),"-i",audio_path,
-            "-map","0:v:0","-map","1:a:0",
-            "-c:v","mpeg4","-q:v","4","-c:a","aac","-b:a","192k",
-            "-shortest",str(out_path)
-        ]
-        run_cmd(cmd2,timeout=max(180,int(duration*8)))
-    try: temp_video.unlink(missing_ok=True)
-    except Exception: pass
-    if progress: progress.progress(1.0,text="Concluído.")
+    finally:
+        silent.unlink(missing_ok=True)
+    if progress: progress.progress(1.0,text='Concluído.')
 
 # ---------- Streamlit UI ----------
 
@@ -713,18 +881,18 @@ lyrics=st.text_area("3. Letra (opcional, mas RECOMENDADA para precisão máxima)
 
 col1,col2=st.columns(2)
 with col1:
-    model=st.selectbox("Qualidade da transcrição",["small","medium","large-v3-turbo"],index=1,
+    model=st.selectbox("Qualidade da transcrição",["small","medium","large-v3-turbo","large-v3"],index=2,
                        help="medium é o equilíbrio. large-v3-turbo pode ser pesado no Streamlit.")
 with col2:
     theme=st.selectbox("Direção visual",["Auto","Black & White","Beige Editorial","Dark Editorial"])
 
 col3,col4=st.columns(2)
 with col3:
-    res_label=st.selectbox("Resolução",["720×1280 — recomendado","1080×1920 — alta"],index=0)
+    res_label=st.selectbox("Resolução",["1080×1920 — recomendada","720×1280 — econômica"],index=0)
 with col4:
     quality=st.selectbox("Render",["Equilibrado","Alta qualidade"],index=0)
 
-st.info("Dica: para máxima fidelidade da letra, cole a letra oficial. O áudio continua sendo usado para sincronizar o vídeo.")
+st.info("Dica: se você tiver a letra oficial, cole-a. A IA agora reconhece o áudio mesmo assim e alinha a letra palavra por palavra aos timestamps reais do cantor.")
 
 registry=load_font_registry()
 st.caption(f"Fontes disponíveis: {len(registry)}/10. O sistema usa fallback automaticamente se o download das fontes não estiver disponível.")
@@ -754,20 +922,21 @@ if st.button("🚀 CRIAR LYRIC VIDEO",type="primary",use_container_width=True):
         duration=media_duration(str(audio_path))
         if duration<=0: duration=60.0
 
+        try:
+            # Always obtain real word timestamps from the audio. If the user supplied
+            # lyrics, they replace the displayed spelling but inherit these timestamps.
+            asr_words,lang,detdur=transcribe_audio(str(audio_path),model,status)
+        except Exception as e:
+            if model!="small":
+                status.warning("O modelo escolhido não iniciou no ambiente. Tentando automaticamente o modelo small.")
+                asr_words,lang,detdur=transcribe_audio(str(audio_path),"small",status)
+            else:
+                raise
         if lyrics.strip():
-            words=words_from_manual_lyrics(lyrics,duration)
-            lang="pt"
-            status.write("Usando a letra fornecida e distribuindo a sincronização automaticamente.")
+            status.write("Alinhando a letra fornecida palavra por palavra ao áudio…")
+            words=align_manual_lyrics(lyrics,asr_words,duration)
         else:
-            try:
-                words,lang,detdur=transcribe_audio(str(audio_path),model,status)
-            except Exception as e:
-                # automatic fallback to small if medium/large cannot initialize
-                if model!="small":
-                    status.warning("O modelo escolhido não iniciou no ambiente. Tentando automaticamente o modelo small.")
-                    words,lang,detdur=transcribe_audio(str(audio_path),"small",status)
-                else:
-                    raise
+            words=asr_words
 
         words=clean_transcription(words)
         if not words:
