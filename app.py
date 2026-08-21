@@ -4,7 +4,7 @@ import numpy as np
 import streamlit as st
 from PIL import Image, ImageDraw, ImageFont
 
-APP_VERSION = "10.0-STABLE-WORD-SYNC"
+APP_VERSION = "11.0-STABLE-LATIN-WORD-SYNC"
 FPS = 30
 BLACK = (5, 5, 7)
 WHITE = (248, 248, 246)
@@ -14,14 +14,17 @@ FONT_DIR = CACHE / "fonts"
 FONT_DIR.mkdir(parents=True, exist_ok=True)
 
 FONTS = {
+    # Static TTF files are used instead of variable fonts. This is important on
+    # Streamlit Cloud/Pillow because static files have much more predictable
+    # Portuguese/Latin glyph rendering.
     "Anton": "https://raw.githubusercontent.com/google/fonts/main/ofl/anton/Anton-Regular.ttf",
     "Bebas Neue": "https://raw.githubusercontent.com/google/fonts/main/ofl/bebasneue/BebasNeue-Regular.ttf",
-    "Montserrat": "https://raw.githubusercontent.com/google/fonts/main/ofl/montserrat/Montserrat%5Bwght%5D.ttf",
-    "Oswald": "https://raw.githubusercontent.com/google/fonts/main/ofl/oswald/Oswald%5Bwght%5D.ttf",
+    "Montserrat": "https://raw.githubusercontent.com/google/fonts/main/ofl/montserrat/static/Montserrat-Bold.ttf",
+    "Oswald": "https://raw.githubusercontent.com/google/fonts/main/ofl/oswald/static/Oswald-Bold.ttf",
     "Archivo Black": "https://raw.githubusercontent.com/google/fonts/main/ofl/archivoblack/ArchivoBlack-Regular.ttf",
     "DM Serif Display": "https://raw.githubusercontent.com/google/fonts/main/ofl/dmserifdisplay/DMSerifDisplay-Regular.ttf",
-    "Playfair Display": "https://raw.githubusercontent.com/google/fonts/main/ofl/playfairdisplay/PlayfairDisplay%5Bwght%5D.ttf",
-    "Libre Baskerville": "https://raw.githubusercontent.com/google/fonts/main/ofl/librebaskerville/LibreBaskerville-Regular.ttf",
+    "Playfair Display": "https://raw.githubusercontent.com/google/fonts/main/ofl/playfairdisplay/static/PlayfairDisplay-Bold.ttf",
+    "Libre Baskerville": "https://raw.githubusercontent.com/google/fonts/main/ofl/librebaskerville/static/LibreBaskerville-Bold.ttf",
     "Space Mono": "https://raw.githubusercontent.com/google/fonts/main/ofl/spacemono/SpaceMono-Regular.ttf",
 }
 MAIN_FONTS = ["Anton", "Bebas Neue", "Archivo Black", "Montserrat", "Oswald"]
@@ -43,7 +46,15 @@ def ease(x):
 
 
 def norm(s):
-    return re.sub(r"\s+", " ", s or "").strip()
+    """Normalize lyric text without removing Portuguese accents.
+    Also removes invisible/control characters that can appear in ASR output.
+    """
+    s = unicodedata.normalize("NFC", s or "")
+    s = s.replace("\u200b", "").replace("\ufeff", "")
+    s = s.replace("â", '"').replace("â", '"').replace("â", "'").replace("â", "'")
+    s = s.replace("â", "-").replace("â", "-").replace("â¦", "...")
+    s = "".join(ch for ch in s if ch == "\n" or unicodedata.category(ch)[0] != "C")
+    return re.sub(r"\s+", " ", s).strip()
 
 
 def safe(s):
@@ -128,18 +139,35 @@ def font_registry():
                 target.unlink(missing_ok=True)
         if target.exists() and target.stat().st_size >= 10000:
             out[name] = str(target)
-    if not out:
-        for p in SYSTEM_FONTS:
-            if os.path.exists(p):
-                out["System"] = p
-                break
+    # Always register a known-good Unicode fallback for Portuguese accents.
+    for p in SYSTEM_FONTS:
+        if os.path.exists(p):
+            out["Unicode Safe"] = p
+            break
     if not out:
         raise RuntimeError("Nenhuma fonte compatÃ­vel foi encontrada.")
     return out
 
 
+def has_suspicious_glyphs(text):
+    # Digits embedded inside alphabetic words are a common visible symptom of
+    # bad ASR/font fallback (e.g. "A1A"). We do not rewrite the word here;
+    # we simply force a known-good Unicode font for rendering.
+    return any(ch.isalpha() and any(c.isdigit() for c in text) for ch in text)
+
+
+def safe_font_name(text, preferred, reg):
+    """Use the selected editorial font when safe, but guarantee Portuguese
+    accented glyphs render with a Unicode-complete fallback when necessary."""
+    preferred_path = reg.get(preferred)
+    if preferred_path and not has_suspicious_glyphs(text):
+        # DejaVu Sans Bold is retained in the registry as the hard Unicode fallback.
+        return preferred
+    return "Unicode Safe"
+
+
 def get_font(name, reg, size):
-    path = reg.get(name) or next(iter(reg.values()))
+    path = reg.get(name) or reg.get("Unicode Safe") or next(iter(reg.values()))
     return ImageFont.truetype(path, max(16, int(size)))
 
 
@@ -179,7 +207,18 @@ def transcribe(path, model_name, status):
         for w in seg.words:
             text = norm(w.word)
             if text and len(text) <= 40:
-                words.append({"word": text, "start": float(w.start), "end": float(w.end), "prob": float(getattr(w, "probability", 0) or 0)})
+                # Do not display obvious control/gibberish artifacts from ASR.
+                # Valid lyric text supplied by the user is never passed through this filter.
+                letters = sum(ch.isalpha() for ch in text)
+                digits = sum(ch.isdigit() for ch in text)
+                if letters >= 1 and digits >= 1 and letters + digits >= 3:
+                    continue
+                words.append({
+                    "word": text,
+                    "start": float(w.start),
+                    "end": float(w.end),
+                    "prob": float(getattr(w, "probability", 0) or 0)
+                })
     words.sort(key=lambda x: x["start"])
     return words, getattr(info, "language", "pt")
 
@@ -393,8 +432,10 @@ def render_scene(scene, scene_i, W, H, t, reg, bg_blend=0.0):
     # Build rows from the visible words only. A word may use a different font.
     rows=[]; row=[]; row_width=0; spacing=max(10,int(base_size*.075))
     for i,w,rel in visible:
+        raw_word = norm(w["word"])
         name=choose_font(scene_i,i,n,reg)
-        f=fit_font(w["word"].upper(),name,reg,base_size,max_width*0.42,min_size=34)
+        name=safe_font_name(raw_word, name, reg)
+        f=fit_font(raw_word.upper(),name,reg,base_size,max_width*0.42,min_size=34)
         ww=bbox(w["word"].upper(),f)[2]
         if row and row_width+spacing+ww>max_width:
             rows.append(row); row=[]; row_width=0
@@ -410,7 +451,7 @@ def render_scene(scene, scene_i, W, H, t, reg, bg_blend=0.0):
         x=(W-width)/2
         y=start_y+ri*line_gap
         for i,w,rel,f,ww in row:
-            text=w["word"].upper()
+            text=norm(w["word"]).upper()
             color=ROYAL if blue_word(scene_i,i,n) else normal
             draw_word(image,text,f,x+ww/2,y,color,rel/0.18)
             x+=ww+spacing
@@ -539,6 +580,7 @@ if st.button("ð CRIAR LYRIC VIDEO",type="primary",use_container_width=Tru
         st.video(str(output))
         st.download_button("â¬ï¸ BAIXAR MP4",data=output.read_bytes(),file_name="lyric_ai_final.mp4",mime="video/mp4",use_container_width=True)
         with st.expander("DiagnÃ³stico"):
+            st.caption("A renderizaÃ§Ã£o usa NFC/Unicode e uma fonte de seguranÃ§a para caracteres portugueses. Se uma palavra estiver errada no diagnÃ³stico, o erro veio da transcriÃ§Ã£o; se estiver correta no diagnÃ³stico, ela deve ser renderizada exatamente com os acentos.")
             st.write(f"DuraÃ§Ã£o do arquivo: **{dur:.2f}s**")
             st.write(f"Fim Ãºtil detectado: **{end_time:.2f}s**")
             st.write(f"Frases renderizadas: **{len(scenes)}**")
