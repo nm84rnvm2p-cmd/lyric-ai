@@ -4,7 +4,7 @@ import numpy as np
 import streamlit as st
 from PIL import Image, ImageDraw, ImageFont
 
-APP_VERSION = "11.1-STABLE-LATIN-WORD-SYNC-FIX"
+APP_VERSION = "11.0-STABLE-LATIN-WORD-SYNC"
 FPS = 30
 BLACK = (5, 5, 7)
 WHITE = (248, 248, 246)
@@ -51,8 +51,8 @@ def norm(s):
     """
     s = unicodedata.normalize("NFC", s or "")
     s = s.replace("\u200b", "").replace("\ufeff", "")
-    s = s.replace("â", '"').replace("â", '"').replace("â", "'").replace("â", "'")
-    s = s.replace("â", "-").replace("â", "-").replace("â¦", "...")
+    s = s.replace("â", '"').replace("â", '"').replace("â", "'").replace("â", "'")
+    s = s.replace("â", "-").replace("â", "-").replace("â¦", "...")
     s = "".join(ch for ch in s if ch == "\n" or unicodedata.category(ch)[0] != "C")
     return re.sub(r"\s+", " ", s).strip()
 
@@ -189,7 +189,7 @@ def fit_font(text, name, reg, size, max_width, min_size=30):
 def transcribe(path, model_name, status):
     from faster_whisper import WhisperModel
     if status:
-        status.write(f"ðï¸ Reconhecendo palavra por palavra com **{model_name}**â¦")
+        status.write(f"ðï¸ Reconhecendo palavra por palavra com **{model_name}**â¦")
     model = WhisperModel(
         model_name, device="cpu", compute_type="int8",
         cpu_threads=max(2, min(8, os.cpu_count() or 4)), num_workers=1
@@ -229,7 +229,7 @@ def parse_timed(text):
         raw = raw.strip()
         if not raw:
             continue
-        m = re.match(r"^(\d{1,2}):(\d{2})(?:[.,](\d{1,3}))?\s*[-ââ]\s*(\d{1,2}):(\d{2})(?:[.,](\d{1,3}))?\s*\|\s*(.+)$", raw)
+        m = re.match(r"^(\d{1,2}):(\d{2})(?:[.,](\d{1,3}))?\s*[-ââ]\s*(\d{1,2}):(\d{2})(?:[.,](\d{1,3}))?\s*\|\s*(.+)$", raw)
         if m:
             def tm(a,b,c): return int(a)*60 + int(b) + float("0."+(c or "0"))
             result.append({"start": tm(m.group(1),m.group(2),m.group(3)), "end": tm(m.group(4),m.group(5),m.group(6)), "text": norm(m.group(7))})
@@ -290,65 +290,33 @@ def align_phrase(text, start, end, asr, cursor_hint=0):
 
 
 def align_plain(text, asr, audio_end):
-    """Align each pasted lyric line to the ASR timeline.
-
-    FIX (v11.1): the previous version called `break` whenever a line failed
-    to match AND the ASR cursor had already run past the end of the
-    recognized words. That silently threw away every remaining line, which
-    is why long songs ended up with only 1-2 scenes total -> the background
-    color / font (which are picked from the scene index) never alternated
-    and the whole video rendered as one flat black frame.
-
-    Now, when matching is exhausted, we distribute the remaining lines
-    evenly across whatever audio time is left instead of dropping them, and
-    we guarantee scene start times are always monotonically increasing.
-    """
-    lines = plain_lines(text)
-    scenes = []
-    cursor = 0
-    n_lines = len(lines)
-    for pid, line in enumerate(lines):
-        toks = re.findall(r"\S+", line)
-        matches = []
+    lines=plain_lines(text)
+    scenes=[]; cursor=0
+    for pid,line in enumerate(lines):
+        toks=re.findall(r"\S+",line)
+        matches=[]
         for tok in toks:
-            best = None; score_best = 0
-            for j in range(cursor, min(len(asr), cursor + 50)):
-                s = similarity(tok, asr[j]["word"])
-                if s > score_best:
-                    score_best = s; best = j
-                if s >= 0.99:
-                    break
-            if best is not None and score_best >= 0.40:
-                matches.append((tok, best)); cursor = best + 1
-
-        prev_end = scenes[-1]["end"] if scenes else 0.0
-
+            best=None; score_best=0
+            for j in range(cursor,min(len(asr),cursor+50)):
+                s=similarity(tok,asr[j]["word"])
+                if s>score_best:
+                    score_best=s; best=j
+                if s>=0.99: break
+            if best is not None and score_best>=0.40:
+                matches.append((tok,best)); cursor=best+1
         if matches:
-            st = asr[matches[0][1]]["start"]
-            en = asr[matches[-1][1]]["end"]
+            st=asr[matches[0][1]]["start"]
+            en=asr[matches[-1][1]]["end"]
         elif cursor < len(asr):
-            st = asr[cursor]["start"]
-            en = min(audio_end, st + max(0.8, 0.30 * len(toks)))
+            st=asr[cursor]["start"]; en=min(audio_end,st+max(0.8,0.30*len(toks)))
         else:
-            # ASR words exhausted: never abandon the remaining lyric lines.
-            # Spread whatever audio time is left evenly across what's left.
-            remaining = max(1, n_lines - pid)
-            span = max(0.6, (audio_end - prev_end) / remaining)
-            st = prev_end
-            en = min(audio_end, st + span)
-
-        # Never let a new scene start before the previous one ends.
-        if st < prev_end:
-            st = prev_end
-        en = min(audio_end, max(en, st + 0.25))
-        if en <= st:
-            break  # genuinely out of audio time left
-
-        words = align_phrase(line, st, en, asr)
+            break
+        en=min(audio_end,max(en,st+0.25))
+        words=align_phrase(line,st,en,asr)
         if words:
             for w in words:
-                w["phrase_id"] = pid; w["phrase_text"] = line
-            scenes.append({"start": st, "end": min(audio_end, en + 0.18), "words": words, "phrase_text": line, "phrase_id": pid})
+                w["phrase_id"]=pid; w["phrase_text"]=line
+            scenes.append({"start":st,"end":min(audio_end,en+0.18),"words":words,"phrase_text":line,"phrase_id":pid})
     return scenes
 
 
@@ -501,7 +469,7 @@ def render_video(audio_path, scenes, reg, output, resolution, quality, progress)
     W,H=resolution
     dur=media_duration(audio_path)
     if dur<=0: raise RuntimeError("NÃ£o foi possÃ­vel identificar a duraÃ§Ã£o da mÃºsica.")
-    # Use audio duration as the hard upper bound. Captions never vanish at 10â15 seconds.
+    # Use audio duration as the hard upper bound. Captions never vanish at 10â15 seconds.
     total_frames=max(1,int(math.ceil(dur*FPS)))
     silent=Path(output).with_name("silent_lyric.mp4")
     crf="14" if quality=="Alta qualidade" else "17"
@@ -548,8 +516,8 @@ def render_video(audio_path, scenes, reg, output, resolution, quality, progress)
     if progress: progress.progress(1.0,text="VÃ­deo concluÃ­do.")
 
 
-st.set_page_config(page_title="Lyric AI Studio",page_icon="ðµ",layout="centered")
-st.title("ðµ Lyric AI Studio")
+st.set_page_config(page_title="Lyric AI Studio",page_icon="ðµ",layout="centered")
+st.title("ðµ Lyric AI Studio")
 st.caption(f"Word-Sync Kinetic Engine Â· {APP_VERSION}")
 
 audio=st.file_uploader("1. MÃºsica ou vÃ­deo",type=["mp3","wav","m4a","mp4","mov","webm"])
@@ -560,31 +528,31 @@ with c1:
     model=st.selectbox("Reconhecimento",["small","medium","large-v3-turbo","large-v3"],index=2)
 with c2:
     quality=st.selectbox("Qualidade",["Equilibrado","Alta qualidade"],index=1)
-resolution=st.selectbox("ResoluÃ§Ã£o",["1080 Ã 1920","720 Ã 1280"],index=0)
+resolution=st.selectbox("ResoluÃ§Ã£o",["1080 Ã 1920","720 Ã 1280"],index=0)
 
 st.info("O fundo agora alterna PRETO/BRANCO por frase, com mistura suave na troca. As palavras aparecem uma por uma nos timestamps do cantor. Azul royal Ã© usado apenas em palavras selecionadas.")
 reg=font_registry()
 st.caption(f"Fontes disponÃ­veis: {len(reg)}")
 
-if st.button("ð CRIAR LYRIC VIDEO",type="primary",use_container_width=True):
+if st.button("ð CRIAR LYRIC VIDEO",type="primary",use_container_width=True):
     if not audio:
         st.error("Envie a mÃºsica primeiro.")
         st.stop()
     temp=Path(tempfile.mkdtemp(prefix="lyric_ai_"))
     audio_path=temp/safe(audio.name)
     audio_path.write_bytes(audio.getbuffer())
-    status=st.empty(); progress=st.progress(0,text="Preparandoâ¦")
+    status=st.empty(); progress=st.progress(0,text="Preparandoâ¦")
     try:
         dur=media_duration(str(audio_path))
         if dur<=0: raise RuntimeError("NÃ£o foi possÃ­vel identificar a duraÃ§Ã£o do Ã¡udio.")
         end_time=detect_audio_end(str(audio_path),dur)
-        status.write(f"â±ï¸ DuraÃ§Ã£o: {dur:.2f}s Â· fim Ãºtil detectado: {end_time:.2f}s")
+        status.write(f"â±ï¸ DuraÃ§Ã£o: {dur:.2f}s Â· fim Ãºtil detectado: {end_time:.2f}s")
 
         try:
             asr,lang=transcribe(str(audio_path),model,status)
         except Exception:
             if model=="small": raise
-            status.warning("O modelo escolhido falhou no ambiente; tentando small automaticamenteâ¦")
+            status.warning("O modelo escolhido falhou no ambiente; tentando small automaticamenteâ¦")
             asr,lang=transcribe(str(audio_path),"small",status)
         asr=[w for w in asr if w["start"]<end_time]
         if not asr and not lyrics.strip():
@@ -592,10 +560,10 @@ if st.button("ð CRIAR LYRIC VIDEO",type="primary",use_container_width=True):
 
         timed=parse_timed(lyrics) if lyrics.strip() else []
         if timed:
-            status.write("ð Tempos das frases encontrados. Refinando cada palavra pelo Ã¡udioâ¦")
+            status.write("ð Tempos das frases encontrados. Refinando cada palavra pelo Ã¡udioâ¦")
             scenes=build_timed(timed,asr,end_time)
         elif lyrics.strip():
-            status.write("ð§  Alinhando a letra oficial ao canto real palavra por palavraâ¦")
+            status.write("ð§  Alinhando a letra oficial ao canto real palavra por palavraâ¦")
             scenes=align_plain(lyrics,asr,end_time)
         else:
             scenes=auto_scenes(asr,end_time)
@@ -603,25 +571,14 @@ if st.button("ð CRIAR LYRIC VIDEO",type="primary",use_container_width=True):
         if not scenes:
             raise RuntimeError("A IA nÃ£o conseguiu criar frases sincronizadas. Tente colar a letra oficial.")
 
-        # SAFETY NET: if far fewer scenes came out than lyric lines went in,
-        # the plain-text alignment likely struggled with this song (bad ASR
-        # match rate). Falling back to auto_scenes (pure audio-gap detection)
-        # still gives per-phrase alternation instead of one static scene.
-        pasted_lines = len(plain_lines(lyrics)) if lyrics.strip() and not timed else 0
-        if pasted_lines >= 4 and len(scenes) <= max(1, pasted_lines // 4):
-            status.warning(f"Alinhamento da letra colada rendeu poucas cenas ({len(scenes)} de {pasted_lines} linhas). Usando deteccao automatica por pausas no audio como respaldo.")
-            fallback = repair_scenes(auto_scenes(asr, end_time), end_time)
-            if len(fallback) > len(scenes):
-                scenes = fallback
-
         progress.progress(.20,text=f"SincronizaÃ§Ã£o pronta: {sum(len(s['words']) for s in scenes)} palavras em {len(scenes)} frases.")
         size=(1080,1920) if resolution.startswith("1080") else (720,1280)
         output=temp/"lyric_ai_final.mp4"
-        status.write("ð¬ Renderizando palavra por palavra e alternando os fundosâ¦")
+        status.write("ð¬ Renderizando palavra por palavra e alternando os fundosâ¦")
         render_video(str(audio_path),scenes,reg,str(output),size,quality,progress)
-        status.success("â VÃ­deo criado.")
+        status.success("â VÃ­deo criado.")
         st.video(str(output))
-        st.download_button("â¬ï¸ BAIXAR MP4",data=output.read_bytes(),file_name="lyric_ai_final.mp4",mime="video/mp4",use_container_width=True)
+        st.download_button("â¬ï¸ BAIXAR MP4",data=output.read_bytes(),file_name="lyric_ai_final.mp4",mime="video/mp4",use_container_width=True)
         with st.expander("DiagnÃ³stico"):
             st.caption("A renderizaÃ§Ã£o usa NFC/Unicode e uma fonte de seguranÃ§a para caracteres portugueses. Se uma palavra estiver errada no diagnÃ³stico, o erro veio da transcriÃ§Ã£o; se estiver correta no diagnÃ³stico, ela deve ser renderizada exatamente com os acentos.")
             st.write(f"DuraÃ§Ã£o do arquivo: **{dur:.2f}s**")
@@ -631,5 +588,5 @@ if st.button("ð CRIAR LYRIC VIDEO",type="primary",use_container_width=True):
             st.write(f"Idioma: **{lang}**")
             st.code("\n".join(f"{s['start']:.2f}-{s['end']:.2f} | {s['phrase_text']}" for s in scenes))
     except Exception as e:
-        st.error("â A geraÃ§Ã£o falhou.")
+        st.error("â A geraÃ§Ã£o falhou.")
         st.code(str(e))
