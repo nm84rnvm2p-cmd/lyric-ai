@@ -223,26 +223,40 @@ def transcribe(path, model_name, status):
     return words, getattr(info, "language", "pt")
 
 
-def parse_timed(text):
-    result = []
-    for raw in text.splitlines():
-        raw = raw.strip()
-        if not raw:
-            continue
-        m = re.match(r"^(\d{1,2}):(\d{2})(?:[.,](\d{1,3}))?\s*[-ââ]\s*(\d{1,2}):(\d{2})(?:[.,](\d{1,3}))?\s*\|\s*(.+)$", raw)
-        if m:
-            def tm(a,b,c): return int(a)*60 + int(b) + float("0."+(c or "0"))
-            result.append({"start": tm(m.group(1),m.group(2),m.group(3)), "end": tm(m.group(4),m.group(5),m.group(6)), "text": norm(m.group(7))})
-            continue
-        m = re.match(r"^(\d{1,2}):(\d{2})(?:[.,](\d{1,3}))?\s*\|\s*(.+)$", raw)
-        if m:
-            result.append({"start": int(m.group(1))*60+int(m.group(2))+float("0."+(m.group(3) or "0")), "text": norm(m.group(4))})
-            continue
-        m = re.match(r"^(\d+(?:[.,]\d+)?)\s*\|\s*(.+)$", raw)
-        if m:
-            result.append({"start": float(m.group(1).replace(",", ".")), "text": norm(m.group(2))})
-    return sorted(result, key=lambda x: x["start"])
+def parse_one_time(value):
+    value = value.strip().replace(",", ".")
+    parts = value.split(":")
+    if len(parts) == 2:
+        return int(parts[0]) * 60 + float(parts[1])
+    return float(value)
 
+
+def parse_timed(text):
+    """Parse timed lyrics, including timestamp line followed by lyric line."""
+    lines=[x.strip() for x in (text or "").replace("\r", "").split("\n")]
+    result=[]; i=0
+    range_re=re.compile(r"^\s*(\d{1,2}:\d{2}(?:[.,]\d{1,3})?|\d+(?:[.,]\d+)?)\s*[-ââ]\s*(\d{1,2}:\d{2}(?:[.,]\d{1,3})?|\d+(?:[.,]\d+)?)(?:\s*\|\s*(.*))?\s*$")
+    start_re=re.compile(r"^\s*(\d{1,2}:\d{2}(?:[.,]\d{1,3})?|\d+(?:[.,]\d+)?)\s*\|\s*(.+?)\s*$")
+    while i < len(lines):
+        raw=lines[i]
+        if not raw:
+            i+=1; continue
+        m=range_re.match(raw)
+        if m:
+            st=parse_one_time(m.group(1)); en=parse_one_time(m.group(2)); lyric=norm(m.group(3) or "")
+            if not lyric and i+1<len(lines):
+                j=i+1
+                while j<len(lines) and not lines[j]: j+=1
+                if j<len(lines) and not range_re.match(lines[j]):
+                    lyric=norm(lines[j]); i=j
+            if lyric and en>st: result.append({"start":st,"end":en,"text":lyric})
+            i+=1; continue
+        m=start_re.match(raw)
+        if m:
+            st=parse_one_time(m.group(1)); lyric=norm(m.group(2))
+            if lyric: result.append({"start":st,"text":lyric})
+        i+=1
+    return sorted(result,key=lambda x:x["start"])
 
 def plain_lines(text):
     return [norm(x) for x in text.splitlines() if norm(x)]
