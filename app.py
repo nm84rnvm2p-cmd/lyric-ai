@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import tempfile
 import unicodedata
+import difflib
 from pathlib import Path
 
 import streamlit as st
@@ -16,13 +17,14 @@ from PIL import Image, ImageDraw, ImageFont
 # CONFIGURAÇÃO
 # ============================================================
 
-APP_VERSION = "17.0-VISUAL-FINAL"
+APP_VERSION = "18.0-VISUAL-FINAL"
 
 W = 720
 H = 1280
 FPS = 20
 
-FADE = 0.18
+# Duração da transição entre fundos
+FADE = 0.35
 
 BLACK = (0, 0, 0)
 WHITE = (255, 255, 255)
@@ -31,7 +33,6 @@ ROYAL = (45, 92, 255)
 
 # ============================================================
 # FONTES LOCAIS
-# Não baixa nenhuma fonte durante a execução.
 # ============================================================
 
 FONT_CANDIDATES = [
@@ -51,14 +52,29 @@ FONT_CANDIDATES = [
         "DejaVuSerif-Bold.ttf",
     ),
     (
-        "Liberation",
+        "Liberation Sans",
         "/usr/share/fonts/truetype/liberation2/"
         "LiberationSans-Bold.ttf",
     ),
     (
-        "Liberation",
+        "Liberation Sans",
         "/usr/share/fonts/truetype/liberation/"
         "LiberationSans-Bold.ttf",
+    ),
+    (
+        "Lato",
+        "/usr/share/fonts/truetype/lato/"
+        "Lato-Bold.ttf",
+    ),
+    (
+        "Lato Black",
+        "/usr/share/fonts/truetype/lato/"
+        "Lato-Black.ttf",
+    ),
+    (
+        "FreeSans",
+        "/usr/share/fonts/truetype/freefont/"
+        "FreeSansBold.ttf",
     ),
 ]
 
@@ -68,16 +84,13 @@ FONT_CANDIDATES = [
 # ============================================================
 
 def clean_text(value):
-    """
-    Mantém Unicode real.
-    Remove somente caracteres de controle problemáticos.
-    NÃO faz conversões latin1/utf8 perigosas.
-    """
-
     if value is None:
         return ""
 
-    text = unicodedata.normalize("NFC", str(value))
+    text = unicodedata.normalize(
+        "NFC",
+        str(value),
+    )
 
     text = (
         text
@@ -93,17 +106,16 @@ def clean_text(value):
         not in {"Cc", "Cf"}
     )
 
-    text = re.sub(r"\s+", " ", text)
+    text = re.sub(
+        r"\s+",
+        " ",
+        text,
+    )
 
     return text.strip()
 
 
 def normalize_for_match(text):
-    """
-    Versão somente para comparar palavras.
-    A palavra original nunca é alterada.
-    """
-
     text = clean_text(text).lower()
 
     text = unicodedata.normalize(
@@ -111,13 +123,11 @@ def normalize_for_match(text):
         text,
     )
 
-    text = "".join(
+    return "".join(
         c
         for c in text
         if not unicodedata.combining(c)
     )
-
-    return text
 
 
 def safe_filename(name):
@@ -136,7 +146,6 @@ def safe_filename(name):
 # ============================================================
 
 def get_ffmpeg():
-
     try:
         import imageio_ffmpeg
 
@@ -154,13 +163,11 @@ def get_ffmpeg():
         return path
 
     raise RuntimeError(
-        "FFmpeg não foi encontrado. "
-        "Verifique o requirements.txt."
+        "FFmpeg não foi encontrado."
     )
 
 
 def run_cmd(cmd, timeout=300):
-
     result = subprocess.run(
         cmd,
         stdout=subprocess.PIPE,
@@ -170,20 +177,15 @@ def run_cmd(cmd, timeout=300):
     )
 
     if result.returncode != 0:
-
         raise RuntimeError(
             result.stderr[-7000:]
             or "O comando terminou com erro."
         )
 
-    return (
-        result.stdout,
-        result.stderr,
-    )
+    return result.stdout, result.stderr
 
 
 def media_info(path):
-
     _, stderr = run_cmd(
         [
             get_ffmpeg(),
@@ -203,10 +205,8 @@ def media_info(path):
     )
 
     if not match:
-
         raise RuntimeError(
-            "Não foi possível determinar "
-            "a duração do arquivo."
+            "Não foi possível determinar a duração."
         )
 
     duration = (
@@ -229,11 +229,8 @@ def media_info(path):
 # WHISPER
 # ============================================================
 
-@st.cache_resource(
-    show_spinner=False
-)
+@st.cache_resource(show_spinner=False)
 def load_whisper(model_name):
-
     from faster_whisper import WhisperModel
 
     return WhisperModel(
@@ -245,15 +242,8 @@ def load_whisper(model_name):
     )
 
 
-def transcribe(
-    path,
-    model_name,
-    status,
-):
-
-    model = load_whisper(
-        model_name
-    )
+def transcribe(path, model_name, status):
+    model = load_whisper(model_name)
 
     status.write(
         f"Transcrevendo com **{model_name}**..."
@@ -271,10 +261,9 @@ def transcribe(
         vad_filter=False,
         initial_prompt=(
             "Letra de música brasileira "
-            "em português. "
-            "Reconheça todas as palavras, "
-            "repetições, gírias e acentos. "
-            "Não traduza."
+            "em português. Reconheça todas "
+            "as palavras, repetições, gírias "
+            "e acentos. Não traduza."
         ),
     )
 
@@ -282,21 +271,11 @@ def transcribe(
     words = []
 
     for segment in segments_iter:
-
-        start = float(
-            segment.start
-        )
-
-        end = float(
-            segment.end
-        )
-
-        text = clean_text(
-            segment.text
-        )
+        start = float(segment.start)
+        end = float(segment.end)
+        text = clean_text(segment.text)
 
         if text and end > start:
-
             segments.append(
                 {
                     "start": start,
@@ -306,21 +285,13 @@ def transcribe(
             )
 
         for word in segment.words or []:
-
-            word_text = clean_text(
-                word.word
-            )
+            word_text = clean_text(word.word)
 
             if not word_text:
                 continue
 
-            word_start = float(
-                word.start
-            )
-
-            word_end = float(
-                word.end
-            )
+            word_start = float(word.start)
+            word_end = float(word.end)
 
             if word_end <= word_start:
                 continue
@@ -336,12 +307,7 @@ def transcribe(
     return (
         segments,
         words,
-        getattr(
-            info,
-            "language",
-            "pt",
-        )
-        or "pt",
+        getattr(info, "language", "pt") or "pt",
     )
 
 
@@ -349,46 +315,28 @@ def transcribe(
 # FALLBACK DE PALAVRAS
 # ============================================================
 
-def distribute_words(
-    text,
-    start,
-    end,
-):
-
+def distribute_words(text, start, end):
     tokens = re.findall(
         r"\S+",
         clean_text(text),
     )
 
-    if not tokens:
-        return []
-
-    if end <= start:
+    if not tokens or end <= start:
         return []
 
     duration = end - start
-
     step = duration / len(tokens)
 
     result = []
 
     for i, token in enumerate(tokens):
+        word_start = start + i * step
 
-        word_start = (
-            start
-            + i * step
+        word_end = (
+            end
+            if i == len(tokens) - 1
+            else start + (i + 1) * step
         )
-
-        if i == len(tokens) - 1:
-
-            word_end = end
-
-        else:
-
-            word_end = (
-                start
-                + (i + 1) * step
-            )
 
         result.append(
             {
@@ -405,13 +353,10 @@ def distribute_words(
 
 
 # ============================================================
-# COMPARAÇÃO DE PALAVRAS
+# COMPARAÇÃO
 # ============================================================
 
 def similarity(a, b):
-
-    import difflib
-
     aa = normalize_for_match(a)
     bb = normalize_for_match(b)
 
@@ -430,7 +375,7 @@ def similarity(a, b):
 
 
 # ============================================================
-# ALINHAMENTO DA LETRA OFICIAL
+# ALINHAMENTO
 # ============================================================
 
 def align_phrase(
@@ -439,7 +384,6 @@ def align_phrase(
     end,
     asr_words,
 ):
-
     tokens = re.findall(
         r"\S+",
         clean_text(text),
@@ -455,23 +399,14 @@ def align_phrase(
         and word["start"] < end + 0.20
     ]
 
-    result = [
-        None
-        for _ in tokens
-    ]
-
+    result = [None] * len(tokens)
     used = set()
 
-    # Tenta aproveitar os timestamps reais do Whisper.
     for i, token in enumerate(tokens):
-
         best_index = None
         best_score = 0.0
 
-        for j, candidate in enumerate(
-            candidates
-        ):
-
+        for j, candidate in enumerate(candidates):
             if j in used:
                 continue
 
@@ -481,7 +416,6 @@ def align_phrase(
             )
 
             if score > best_score:
-
                 best_score = score
                 best_index = j
 
@@ -489,32 +423,21 @@ def align_phrase(
             best_index is not None
             and best_score >= 0.42
         ):
-
-            candidate = candidates[
-                best_index
-            ]
-
+            candidate = candidates[best_index]
             used.add(best_index)
 
             result[i] = {
                 "word": token,
                 "start": max(
                     start,
-                    min(
-                        end,
-                        candidate["start"],
-                    ),
+                    min(end, candidate["start"]),
                 ),
                 "end": max(
                     start,
-                    min(
-                        end,
-                        candidate["end"],
-                    ),
+                    min(end, candidate["end"]),
                 ),
             }
 
-    # Fallback para palavras que o Whisper não alinhou.
     known = [
         i
         for i, item in enumerate(result)
@@ -522,7 +445,6 @@ def align_phrase(
     ]
 
     for i in range(len(tokens)):
-
         if result[i] is not None:
             continue
 
@@ -563,40 +485,24 @@ def align_phrase(
 
         word_start = (
             left
-            + (
-                right - left
-            )
-            * (
-                (i - previous - 1)
-                / count
-            )
+            + (right - left)
+            * ((i - previous - 1) / count)
         )
 
         word_end = (
             left
-            + (
-                right - left
-            )
-            * (
-                (i - previous)
-                / count
-            )
+            + (right - left)
+            * ((i - previous) / count)
         )
 
         word_start = max(
             start,
-            min(
-                end,
-                word_start,
-            ),
+            min(end, word_start),
         )
 
         word_end = max(
             word_start + 0.06,
-            min(
-                end,
-                word_end,
-            ),
+            min(end, word_end),
         )
 
         result[i] = {
@@ -609,25 +515,18 @@ def align_phrase(
 
 
 # ============================================================
-# LEITURA DOS TIMESTAMPS
+# TIMESTAMPS DA LETRA
 # ============================================================
 
 def parse_time(value):
-
-    value = (
-        value
-        .strip()
-        .replace(",", ".")
-    )
+    value = value.strip().replace(",", ".")
 
     if ":" not in value:
-
         return float(value)
 
     parts = value.split(":")
 
     if len(parts) == 2:
-
         return (
             int(parts[0]) * 60
             + float(parts[1])
@@ -641,17 +540,6 @@ def parse_time(value):
 
 
 def parse_timed_lyrics(text):
-
-    """
-    Aceita:
-
-    00:02.3 - 00:06.8 | frase
-
-    ou:
-
-    00:02.3 | frase
-    """
-
     lines = (
         text or ""
     ).replace(
@@ -662,13 +550,11 @@ def parse_timed_lyrics(text):
     result = []
 
     for line in lines:
-
         line = line.strip()
 
         if not line:
             continue
 
-        # START - END
         match = re.match(
             r"^"
             r"(\d{1,2}:\d{2}(?:[.,]\d{1,3})?"
@@ -682,24 +568,11 @@ def parse_timed_lyrics(text):
         )
 
         if match:
+            start = parse_time(match.group(1))
+            end = parse_time(match.group(2))
+            phrase = clean_text(match.group(3))
 
-            start = parse_time(
-                match.group(1)
-            )
-
-            end = parse_time(
-                match.group(2)
-            )
-
-            phrase = clean_text(
-                match.group(3)
-            )
-
-            if (
-                phrase
-                and end > start
-            ):
-
+            if phrase and end > start:
                 result.append(
                     {
                         "start": start,
@@ -710,7 +583,6 @@ def parse_timed_lyrics(text):
 
             continue
 
-        # START | TEXTO
         match = re.match(
             r"^"
             r"(\d{1,2}:\d{2}(?:[.,]\d{1,3})?"
@@ -721,16 +593,11 @@ def parse_timed_lyrics(text):
         )
 
         if match:
-
             result.append(
                 {
-                    "start": parse_time(
-                        match.group(1)
-                    ),
+                    "start": parse_time(match.group(1)),
                     "end": None,
-                    "text": clean_text(
-                        match.group(2)
-                    ),
+                    "text": clean_text(match.group(2)),
                 }
             )
 
@@ -742,7 +609,7 @@ def parse_timed_lyrics(text):
 
 
 # ============================================================
-# CONSTRUÇÃO DAS CENAS
+# CENAS
 # ============================================================
 
 def build_scenes(
@@ -751,19 +618,10 @@ def build_scenes(
     asr_words,
     sung_end,
 ):
-
     scenes = []
 
-    # --------------------------------------------------------
-    # LETRA COM TIMESTAMPS
-    # --------------------------------------------------------
-
     if timed:
-
-        for i, line in enumerate(
-            timed
-        ):
-
+        for i, line in enumerate(timed):
             start = max(
                 0.0,
                 float(line["start"]),
@@ -773,27 +631,14 @@ def build_scenes(
                 break
 
             if line.get("end") is not None:
-
                 end = min(
                     float(line["end"]),
                     sung_end,
                 )
-
             else:
-
-                if (
-                    i + 1
-                    < len(timed)
-                ):
-
-                    next_start = (
-                        timed[
-                            i + 1
-                        ]["start"]
-                    )
-
+                if i + 1 < len(timed):
+                    next_start = timed[i + 1]["start"]
                 else:
-
                     next_start = sung_end
 
                 end = min(
@@ -812,7 +657,6 @@ def build_scenes(
             )
 
             if not words:
-
                 words = distribute_words(
                     line["text"],
                     start,
@@ -820,26 +664,18 @@ def build_scenes(
                 )
 
             if words:
-
                 scenes.append(
                     {
                         "start": start,
                         "end": end,
-                        "text": clean_text(
-                            line["text"]
-                        ),
+                        "text": clean_text(line["text"]),
                         "words": words,
                     }
                 )
 
         return scenes
 
-    # --------------------------------------------------------
-    # SEM TIMESTAMPS OFICIAIS
-    # --------------------------------------------------------
-
     for segment in segments:
-
         start = max(
             0.0,
             float(segment["start"]),
@@ -861,7 +697,6 @@ def build_scenes(
         ]
 
         if not segment_words:
-
             segment_words = distribute_words(
                 segment["text"],
                 start,
@@ -869,14 +704,11 @@ def build_scenes(
             )
 
         if segment_words:
-
             scenes.append(
                 {
                     "start": start,
                     "end": end,
-                    "text": clean_text(
-                        segment["text"]
-                    ),
+                    "text": clean_text(segment["text"]),
                     "words": segment_words,
                 }
             )
@@ -888,110 +720,79 @@ def build_scenes(
 # FONTES
 # ============================================================
 
-@st.cache_data(
-    show_spinner=False
-)
+@st.cache_data(show_spinner=False)
 def local_fonts():
-
     found = []
+    paths = set()
 
     for name, path in FONT_CANDIDATES:
-
         if (
             os.path.isfile(path)
-            and path
-            not in [
-                item[1]
-                for item in found
-            ]
+            and path not in paths
         ):
-
             found.append(
                 (
                     name,
                     path,
                 )
             )
+            paths.add(path)
 
     if not found:
-
         raise RuntimeError(
-            "Nenhuma fonte local segura "
-            "foi encontrada no Streamlit Cloud."
+            "Nenhuma fonte local segura foi encontrada."
         )
 
     return found
 
 
-def load_font(
-    path,
-    size,
-):
-
+def load_font(path, size):
     return ImageFont.truetype(
         path,
-        max(
-            20,
-            int(size),
-        ),
+        max(20, int(size)),
     )
 
 
-def text_size(
-    font,
-    text,
-):
-
-    bbox = font.getbbox(
-        text
-    )
+def text_size(font, text):
+    bbox = font.getbbox(text)
 
     return (
-        max(
-            1,
-            bbox[2] - bbox[0],
-        ),
-        max(
-            1,
-            bbox[3] - bbox[1],
-        ),
+        max(1, bbox[2] - bbox[0]),
+        max(1, bbox[3] - bbox[1]),
         bbox,
     )
 
 
 # ============================================================
-# VARIAÇÃO DE FONTES
+# ALTERNÂNCIA DE FONTES
 # ============================================================
 
 def choose_word_font(
     fonts,
     word_index,
 ):
+    if not fonts:
+        raise RuntimeError(
+            "Nenhuma fonte disponível."
+        )
 
     if len(fonts) == 1:
         return fonts[0][1]
 
-    # Grossa continua majoritária.
     pattern = [
-        0,
-        0,
-        1,
-        0,
-        2,
-        0,
-        0,
-        1,
-        0,
-        2,
+        0, 0, 2, 1,
+        3, 0, 4, 2,
+        1, 5, 0, 3,
+        6, 1, 2, 0,
+        4, 3, 1, 5,
+        2, 0, 6, 3,
     ]
 
-    index = (
-        pattern[
-            word_index
-            % len(pattern)
-        ]
-        % len(fonts)
-    )
+    index = pattern[
+        word_index % len(pattern)
+    ]
+
+    index %= len(fonts)
 
     return fonts[index][1]
 
@@ -1003,13 +804,9 @@ def fit_word_font(
     max_width,
     min_size=30,
 ):
-
-    size = int(
-        start_size
-    )
+    size = int(start_size)
 
     while size >= min_size:
-
         font = load_font(
             path,
             size,
@@ -1021,7 +818,6 @@ def fit_word_font(
         )
 
         if width <= max_width:
-
             return font
 
         size -= 2
@@ -1033,34 +829,36 @@ def fit_word_font(
 
 
 # ============================================================
-# AZUL ROYAL
+# AZUL
 # ============================================================
 
 def choose_blue_indexes(
     scene_index,
     word_count,
 ):
-
     if word_count == 0:
         return set()
 
-    # Frase sim / frase não.
-    if scene_index % 2 == 0:
+    # Azul mais frequente.
+    # Aproximadamente 2 a cada 3 frases.
+    if scene_index % 3 == 0:
         return set()
 
     if word_count == 1:
         return {0}
 
-    if word_count <= 4:
+    if word_count <= 3:
+        return {word_count - 1}
+
+    if word_count <= 6:
         return {
-            word_count - 1
+            word_count // 2,
+            word_count - 1,
         }
 
     return {
-        max(
-            0,
-            word_count - 2,
-        ),
+        word_count // 3,
+        max(0, word_count - 2),
         word_count - 1,
     }
 
@@ -1074,63 +872,43 @@ def prepare_scene(
     scene_index,
     fonts,
 ):
-
     words = scene["words"]
-
     count = len(words)
 
-    # 50% horizontal / 50% vertical.
-    if scene_index % 2 == 0:
-        mode = "horizontal"
-    else:
-        mode = "vertical"
-
-    blue_indexes = (
-        choose_blue_indexes(
-            scene_index,
-            count,
-        )
+    # 50% horizontal / 50% vertical
+    mode = (
+        "horizontal"
+        if scene_index % 2 == 0
+        else "vertical"
     )
 
-    safe_width = int(
-        W * 0.86
+    blue_indexes = choose_blue_indexes(
+        scene_index,
+        count,
     )
 
-    safe_height = int(
-        H * 0.68
-    )
+    safe_width = int(W * 0.86)
+    safe_height = int(H * 0.68)
 
     if count <= 3:
-
         base_size = 112
-
     elif count <= 5:
-
         base_size = 98
-
     elif count <= 8:
-
         base_size = 82
-
     else:
-
         base_size = 68
 
     items = []
 
-    for i, word in enumerate(
-        words
-    ):
-
+    for i, word in enumerate(words):
         text = clean_text(
             word["word"]
         ).upper()
 
-        font_path = (
-            choose_word_font(
-                fonts,
-                i,
-            )
+        font_path = choose_word_font(
+            fonts,
+            i + scene_index,
         )
 
         font = fit_word_font(
@@ -1154,28 +932,20 @@ def prepare_scene(
                 "tw": tw,
                 "th": th,
                 "bbox": bbox,
-                "blue": (
-                    i
-                    in blue_indexes
-                ),
-                "start": float(
-                    word["start"]
-                ),
-                "end": float(
-                    word["end"]
-                ),
+                "blue": i in blue_indexes,
+                "start": float(word["start"]),
+                "end": float(word["end"]),
                 "font_path": font_path,
             }
         )
 
     placements = []
 
-    # --------------------------------------------------------
+    # ========================================================
     # VERTICAL
-    # --------------------------------------------------------
+    # ========================================================
 
     if mode == "vertical":
-
         gap = 8
 
         total_height = (
@@ -1183,33 +953,23 @@ def prepare_scene(
                 item["th"]
                 for item in items
             )
-            + gap
-            * max(
+            + gap * max(
                 0,
                 len(items) - 1,
             )
         )
 
-        if (
-            total_height
-            > safe_height
-            and items
-        ):
-
+        if total_height > safe_height and items:
             scale = max(
                 0.58,
-                safe_height
-                / total_height,
+                safe_height / total_height,
             )
 
             for item in items:
-
                 new_size = max(
                     30,
                     int(
-                        item[
-                            "font"
-                        ].size
+                        item["font"].size
                         * scale
                     ),
                 )
@@ -1233,8 +993,7 @@ def prepare_scene(
                     item["th"]
                     for item in items
                 )
-                + gap
-                * max(
+                + gap * max(
                     0,
                     len(items) - 1,
                 )
@@ -1242,18 +1001,12 @@ def prepare_scene(
 
         y = max(
             70,
-            (
-                H
-                - total_height
-            )
-            / 2,
+            (H - total_height) / 2,
         )
 
         for item in items:
-
             x = (
-                W
-                - item["tw"]
+                W - item["tw"]
             ) / 2
 
             placements.append(
@@ -1264,24 +1017,16 @@ def prepare_scene(
                 }
             )
 
-            y += (
-                item["th"]
-                + gap
-            )
+            y += item["th"] + gap
 
-    # --------------------------------------------------------
+    # ========================================================
     # HORIZONTAL
-    # 2 ou 3 palavras por linha.
-    # --------------------------------------------------------
+    # ========================================================
 
     else:
-
         rows = []
-
         current = []
-
         row_width = 0
-
         space = 14
 
         target = (
@@ -1291,70 +1036,41 @@ def prepare_scene(
         )
 
         for item in items:
-
             required = (
                 item["tw"]
                 if not current
-                else (
-                    row_width
-                    + space
-                    + item["tw"]
-                )
+                else row_width
+                + space
+                + item["tw"]
             )
 
             if (
                 current
                 and (
-                    len(current)
-                    >= target
-                    or required
-                    > safe_width
+                    len(current) >= target
+                    or required > safe_width
                 )
             ):
-
-                rows.append(
-                    current
-                )
-
+                rows.append(current)
                 current = []
-
                 row_width = 0
 
-            current.append(
-                item
-            )
+            current.append(item)
 
             if len(current) == 1:
-
-                row_width = (
-                    item["tw"]
-                )
-
+                row_width = item["tw"]
             else:
-
                 row_width += (
-                    space
-                    + item["tw"]
+                    space + item["tw"]
                 )
 
-            if (
-                len(current)
-                == target
-            ):
-
-                rows.append(
-                    current
-                )
-
+            if len(current) == target:
+                rows.append(current)
                 current = []
-
                 row_width = 0
 
         if current:
-
-            rows.append(
-                current
-            )
+            rows.append(current)
 
         gap_y = 18
 
@@ -1366,33 +1082,23 @@ def prepare_scene(
                 )
                 for row in rows
             )
-            + gap_y
-            * max(
+            + gap_y * max(
                 0,
                 len(rows) - 1,
             )
         )
 
-        if (
-            total_height
-            > safe_height
-            and items
-        ):
-
+        if total_height > safe_height and items:
             scale = max(
                 0.55,
-                safe_height
-                / total_height,
+                safe_height / total_height,
             )
 
             for item in items:
-
                 new_size = max(
                     30,
                     int(
-                        item[
-                            "font"
-                        ].size
+                        item["font"].size
                         * scale
                     ),
                 )
@@ -1411,78 +1117,46 @@ def prepare_scene(
                     item["text"],
                 )
 
-            # Reconstruir as linhas depois da redução.
             rows = []
-
             current = []
-
             row_width = 0
 
             for item in items:
-
                 required = (
                     item["tw"]
                     if not current
-                    else (
-                        row_width
-                        + space
-                        + item["tw"]
-                    )
+                    else row_width
+                    + space
+                    + item["tw"]
                 )
 
                 if (
                     current
                     and (
-                        len(current)
-                        >= target
-                        or required
-                        > safe_width
+                        len(current) >= target
+                        or required > safe_width
                     )
                 ):
-
-                    rows.append(
-                        current
-                    )
-
+                    rows.append(current)
                     current = []
-
                     row_width = 0
 
-                current.append(
-                    item
-                )
+                current.append(item)
 
                 if len(current) == 1:
-
-                    row_width = (
-                        item["tw"]
-                    )
-
+                    row_width = item["tw"]
                 else:
-
                     row_width += (
-                        space
-                        + item["tw"]
+                        space + item["tw"]
                     )
 
-                if (
-                    len(current)
-                    == target
-                ):
-
-                    rows.append(
-                        current
-                    )
-
+                if len(current) == target:
+                    rows.append(current)
                     current = []
-
                     row_width = 0
 
             if current:
-
-                rows.append(
-                    current
-                )
+                rows.append(current)
 
             total_height = (
                 sum(
@@ -1492,8 +1166,7 @@ def prepare_scene(
                     )
                     for row in rows
                 )
-                + gap_y
-                * max(
+                + gap_y * max(
                     0,
                     len(rows) - 1,
                 )
@@ -1501,15 +1174,10 @@ def prepare_scene(
 
         y = max(
             70,
-            (
-                H
-                - total_height
-            )
-            / 2,
+            (H - total_height) / 2,
         )
 
         for row in rows:
-
             row_height = max(
                 item["th"]
                 for item in row
@@ -1520,20 +1188,17 @@ def prepare_scene(
                     item["tw"]
                     for item in row
                 )
-                + space
-                * max(
+                + space * max(
                     0,
                     len(row) - 1,
                 )
             )
 
             x = (
-                W
-                - row_width
+                W - row_width
             ) / 2
 
             for item in row:
-
                 placements.append(
                     {
                         **item,
@@ -1542,11 +1207,8 @@ def prepare_scene(
                             y
                             + (
                                 row_height
-                                - item[
-                                    "th"
-                                ]
-                            )
-                            / 2
+                                - item["th"]
+                            ) / 2
                         ),
                     }
                 )
@@ -1556,18 +1218,14 @@ def prepare_scene(
                     + space
                 )
 
-            y += (
-                row_height
-                + gap_y
-            )
+            y += row_height + gap_y
 
-    # A posição final é congelada aqui.
     scene["mode"] = mode
     scene["placements"] = placements
 
 
 # ============================================================
-# CENA ATUAL
+# CENA NO TEMPO
 # ============================================================
 
 def scene_at_time(
@@ -1575,31 +1233,24 @@ def scene_at_time(
     t,
     hint=0,
 ):
-
     if not scenes:
         return -1
 
     index = min(
-        max(
-            0,
-            hint,
-        ),
+        max(0, hint),
         len(scenes) - 1,
     )
 
     while (
-        index + 1
-        < len(scenes)
+        index + 1 < len(scenes)
         and t >= scenes[index]["end"]
     ):
-
         index += 1
 
     while (
         index > 0
         and t < scenes[index]["start"]
     ):
-
         index -= 1
 
     return index
@@ -1607,18 +1258,14 @@ def scene_at_time(
 
 # ============================================================
 # FUNDO
-# SOMENTE PRETO / BRANCO
 # ============================================================
 
-def background_for(
-    scene_index
-):
-
-    if scene_index % 2 == 0:
-
-        return BLACK
-
-    return WHITE
+def background_for(scene_index):
+    return (
+        BLACK
+        if scene_index % 2 == 0
+        else WHITE
+    )
 
 
 def blend_background(
@@ -1626,21 +1273,22 @@ def blend_background(
     second,
     amount,
 ):
-
     amount = max(
         0.0,
-        min(
-            1.0,
-            amount,
-        ),
+        min(1.0, amount),
+    )
+
+    # Ease-in-out / smoothstep
+    smooth = (
+        amount
+        * amount
+        * (3 - 2 * amount)
     )
 
     return tuple(
         int(
-            first[i]
-            * (1 - amount)
-            + second[i]
-            * amount
+            first[i] * (1 - smooth)
+            + second[i] * smooth
         )
         for i in range(3)
     )
@@ -1655,43 +1303,33 @@ def draw_frame(
     scene_index,
     time_position,
 ):
-
-    current_background = (
-        background_for(
-            scene_index
-        )
+    current_background = background_for(
+        scene_index
     )
 
-    background = (
-        current_background
+    background = current_background
+
+    # ========================================================
+    # TRANSIÇÃO PRETO ↔ BRANCO
+    # ========================================================
+
+    elapsed = (
+        time_position
+        - scene["start"]
     )
 
-    # Fade simples entre preto e branco.
     if (
         scene_index > 0
-        and (
-            time_position
-            - scene["start"]
-        )
-        < FADE
+        and 0 <= elapsed < FADE
     ):
-
-        previous_background = (
-            background_for(
-                scene_index - 1
-            )
+        previous_background = background_for(
+            scene_index - 1
         )
 
-        background = (
-            blend_background(
-                previous_background,
-                current_background,
-                (
-                    time_position
-                    - scene["start"]
-                )
-                / FADE,
-            )
+        background = blend_background(
+            previous_background,
+            current_background,
+            elapsed / FADE,
         )
 
     image = Image.new(
@@ -1700,14 +1338,9 @@ def draw_frame(
         background,
     )
 
-    draw = ImageDraw.Draw(
-        image
-    )
+    draw = ImageDraw.Draw(image)
 
-    brightness = (
-        sum(background)
-        / 3
-    )
+    brightness = sum(background) / 3
 
     main_color = (
         BLACK
@@ -1717,120 +1350,47 @@ def draw_frame(
 
     rendered = False
 
-    # --------------------------------------------------------
+    # ========================================================
     # PALAVRAS
-    # --------------------------------------------------------
+    # ========================================================
 
-    for item in scene[
-        "placements"
-    ]:
+    for item in scene["placements"]:
 
-        if (
-            time_position
-            < item["start"]
-        ):
-
+        if time_position < item["start"]:
             continue
 
         rendered = True
 
-        # Fade somente de opacidade.
-        # NÃO existe movimento.
-        alpha = 255
-
-        age = (
-            time_position
-            - item["start"]
+        color = (
+            ROYAL
+            if item["blue"]
+            else main_color
         )
 
-        if age < 0.10:
+        # Sem movimento.
+        # A posição permanece exatamente a mesma
+        # durante toda a existência da palavra.
 
-            alpha = max(
-                0,
-                min(
-                    255,
-                    int(
-                        255
-                        * age
-                        / 0.10
-                    ),
-                ),
-            )
+        draw.text(
+            (
+                item["x"],
+                item["y"],
+            ),
+            item["text"],
+            font=item["font"],
+            fill=color,
+        )
 
-        if item["blue"]:
-
-            color = ROYAL
-
-        else:
-
-            color = main_color
-
-        # Texto azul é SOMENTE texto.
-        # Nenhum retângulo, glow ou fundo.
-        if alpha >= 255:
-
-            draw.text(
-                (
-                    item["x"],
-                    item["y"],
-                ),
-                item["text"],
-                font=item["font"],
-                fill=color,
-            )
-
-        else:
-
-            layer = Image.new(
-                "RGBA",
-                (W, H),
-                (0, 0, 0, 0),
-            )
-
-            layer_draw = (
-                ImageDraw.Draw(
-                    layer
-                )
-            )
-
-            layer_draw.text(
-                (
-                    item["x"],
-                    item["y"],
-                ),
-                item["text"],
-                font=item["font"],
-                fill=(
-                    *color,
-                    alpha,
-                ),
-            )
-
-            image = (
-                Image.alpha_composite(
-                    image.convert(
-                        "RGBA"
-                    ),
-                    layer,
-                ).convert(
-                    "RGB"
-                )
-            )
-
-    # --------------------------------------------------------
+    # ========================================================
     # FADE OUT DA FRASE
-    # --------------------------------------------------------
+    # ========================================================
 
     remaining = (
         scene["end"]
         - time_position
     )
 
-    if (
-        rendered
-        and remaining < FADE
-    ):
-
+    if rendered and remaining < FADE:
         factor = max(
             0.0,
             min(
@@ -1840,7 +1400,6 @@ def draw_frame(
         )
 
         if factor < 0.999:
-
             flat = Image.new(
                 "RGB",
                 image.size,
@@ -1853,101 +1412,55 @@ def draw_frame(
                 factor,
             )
 
-    return (
-        image,
-        rendered,
-    )
+    return image, rendered
 
 
 # ============================================================
-# TESTE REAL DE VISIBILIDADE
+# TESTE DE VISIBILIDADE
 # ============================================================
 
-def validate_text_visibility(
-    scenes
-):
-
+def validate_text_visibility(scenes):
     if not scenes:
         return False
 
-    samples = []
+    for scene in scenes[:10]:
 
-    for scene in scenes:
-
-        if not scene[
-            "placements"
-        ]:
-
+        if not scene["placements"]:
             continue
 
-        first_word = min(
+        first = min(
             scene["placements"],
-            key=lambda x: x[
-                "start"
-            ],
+            key=lambda x: x["start"],
         )
 
-        samples.append(
-            max(
-                scene["start"],
-                first_word["start"]
-                + 0.12,
-            )
+        sample_time = max(
+            scene["start"],
+            first["start"] + 0.15,
         )
 
-    for time_position in samples[:8]:
-
-        index = scene_at_time(
-            scenes,
-            time_position,
-        )
-
-        if index < 0:
-            continue
-
-        frame, rendered = (
-            draw_frame(
-                scenes[index],
-                index,
-                time_position,
-            )
+        frame, rendered = draw_frame(
+            scene,
+            scenes.index(scene),
+            sample_time,
         )
 
         if not rendered:
             continue
 
-        background = (
-            background_for(
-                index
-            )
-        )
-
         pixels = frame.load()
+        background = background_for(
+            scenes.index(scene)
+        )
 
         changed = 0
 
-        # Amostragem leve para não gastar memória.
-        for y in range(
-            0,
-            H,
-            8,
-        ):
+        for y in range(0, H, 8):
+            for x in range(0, W, 8):
 
-            for x in range(
-                0,
-                W,
-                8,
-            ):
-
-                if (
-                    pixels[x, y]
-                    != background
-                ):
-
+                if pixels[x, y] != background:
                     changed += 1
 
                     if changed > 20:
-
                         return True
 
     return False
@@ -1964,89 +1477,47 @@ def render_video(
     quality,
     progress,
 ):
-
-    duration, has_audio = (
-        media_info(
-            audio_path
-        )
+    duration, has_audio = media_info(
+        audio_path
     )
 
     if not has_audio:
-
         raise RuntimeError(
-            "O arquivo enviado "
-            "não possui faixa de áudio."
+            "O arquivo não possui áudio."
         )
 
     fonts = local_fonts()
 
-    # Prepara todos os layouts uma única vez.
-    for i, scene in enumerate(
-        scenes
-    ):
-
+    for i, scene in enumerate(scenes):
         prepare_scene(
             scene,
             i,
             fonts,
         )
 
-    # Não permite gerar um vídeo sem texto.
     if not validate_text_visibility(
         scenes
     ):
-
         raise RuntimeError(
-            "A validação detectou "
-            "que nenhuma legenda seria "
-            "visível. A renderização foi "
-            "cancelada."
+            "A validação detectou que "
+            "nenhuma legenda seria visível."
         )
 
-    last_word_end = max(
-        (
-            float(word["end"])
-            for scene in scenes
-            for word in scene[
-                "words"
-            ]
-        ),
-        default=0.0,
-    )
-
-    # Detecta o final real da fala.
-    # Dá pequena margem para a última sílaba.
-    if last_word_end > 0:
-
-        final_end = min(
-            duration,
-            last_word_end + 0.65,
-        )
-
-    else:
-
-        final_end = duration
-
-    if final_end < 0.5:
-
-        final_end = duration
+    # O vídeo acompanha o áudio completo.
+    final_end = duration
 
     ff = get_ffmpeg()
 
     silent_video = (
-        Path(output_path)
-        .with_name(
+        Path(output_path).with_name(
             "video_sem_audio.mp4"
         )
     )
 
     if quality == "Alta qualidade":
-
         crf = "16"
         preset = "fast"
-
     else:
-
         crf = "18"
         preset = "veryfast"
 
@@ -2085,59 +1556,39 @@ def render_video(
 
     total_frames = max(
         1,
-        int(
-            final_end
-            * FPS
-        ),
+        int(final_end * FPS),
     )
 
     scene_hint = 0
-
     rendered_frames = 0
 
     try:
-
         for frame_index in range(
             total_frames
         ):
+            t = frame_index / FPS
 
-            time_position = (
-                frame_index
-                / FPS
-            )
-
-            scene_hint = (
-                scene_at_time(
-                    scenes,
-                    time_position,
-                    scene_hint,
-                )
+            scene_hint = scene_at_time(
+                scenes,
+                t,
+                scene_hint,
             )
 
             if scene_hint < 0:
-
                 frame = Image.new(
                     "RGB",
                     (W, H),
                     BLACK,
                 )
-
                 rendered = False
-
             else:
-
-                frame, rendered = (
-                    draw_frame(
-                        scenes[
-                            scene_hint
-                        ],
-                        scene_hint,
-                        time_position,
-                    )
+                frame, rendered = draw_frame(
+                    scenes[scene_hint],
+                    scene_hint,
+                    t,
                 )
 
             if rendered:
-
                 rendered_frames += 1
 
             process.stdin.write(
@@ -2146,16 +1597,8 @@ def render_video(
 
             if (
                 progress
-                and frame_index % FPS
-                == 0
+                and frame_index % FPS == 0
             ):
-
-                percent = int(
-                    frame_index
-                    / total_frames
-                    * 100
-                )
-
                 progress.progress(
                     min(
                         0.92,
@@ -2165,15 +1608,14 @@ def render_video(
                     ),
                     text=(
                         f"Renderizando "
-                        f"{percent}%"
+                        f"{int(frame_index / total_frames * 100)}%"
                     ),
                 )
 
         process.stdin.close()
 
         error_text = (
-            process.stderr
-            .read()
+            process.stderr.read()
             .decode(
                 "utf-8",
                 "replace",
@@ -2183,40 +1625,31 @@ def render_video(
         code = process.wait()
 
         if code != 0:
-
             raise RuntimeError(
                 error_text[-7000:]
-                or
-                "FFmpeg falhou "
-                "ao renderizar."
+                or "FFmpeg falhou."
             )
 
     finally:
-
         if process.poll() is None:
-
             try:
-
                 process.kill()
-
             except Exception:
-
                 pass
 
     if rendered_frames <= 0:
-
         silent_video.unlink(
             missing_ok=True
         )
 
         raise RuntimeError(
-            "Nenhum frame com "
-            "legenda foi renderizado."
+            "Nenhum frame com legenda "
+            "foi renderizado."
         )
 
-    # --------------------------------------------------------
-    # ADICIONA O ÁUDIO ORIGINAL
-    # --------------------------------------------------------
+    # ========================================================
+    # ÁUDIO ORIGINAL
+    # ========================================================
 
     run_cmd(
         [
@@ -2237,16 +1670,14 @@ def render_video(
             "-b:a",
             "192k",
             "-t",
-            f"{final_end:.3f}",
+            f"{duration:.3f}",
             "-movflags",
             "+faststart",
             str(output_path),
         ],
         timeout=max(
             180,
-            int(
-                final_end * 8
-            ),
+            int(duration * 8),
         ),
     )
 
@@ -2255,20 +1686,16 @@ def render_video(
     )
 
     if progress:
-
         progress.progress(
             1.0,
             text="Vídeo concluído.",
         )
 
-    return (
-        final_end,
-        rendered_frames,
-    )
+    return duration, rendered_frames
 
 
 # ============================================================
-# INTERFACE STREAMLIT
+# STREAMLIT
 # ============================================================
 
 st.set_page_config(
@@ -2277,13 +1704,10 @@ st.set_page_config(
     layout="centered",
 )
 
-st.title(
-    "🎵 Lyric AI Studio"
-)
+st.title("🎵 Lyric AI Studio")
 
 st.caption(
-    f"Typography Sync · "
-    f"{APP_VERSION}"
+    f"Typography Sync · {APP_VERSION}"
 )
 
 
@@ -2291,20 +1715,20 @@ with st.expander(
     "Como usar",
     expanded=False,
 ):
-
     st.markdown(
         """
-Cole a letra oficial com timestamps para máxima precisão.
+Cole a letra oficial com timestamps.
 
 Exemplo:
 
 `00:02.30 - 00:06.80 | Não tenho vergonha de dizer que sou maluco por você`
 
-Também funciona:
+Ou:
 
 `00:02.30 | Não tenho vergonha de dizer que sou maluco por você`
 
-O fundo alterna automaticamente entre preto e branco.
+O vídeo alterna automaticamente entre fundo preto e branco.
+As fontes e algumas palavras azuis também variam automaticamente.
         """
     )
 
@@ -2322,7 +1746,7 @@ audio = st.file_uploader(
 )
 
 lyrics = st.text_area(
-    "2. Letra oficial (recomendada)",
+    "2. Letra oficial",
     height=230,
     placeholder=(
         "00:02.30 - 00:06.80 | "
@@ -2333,12 +1757,9 @@ lyrics = st.text_area(
 )
 
 
-column1, column2 = st.columns(
-    2
-)
+col1, col2 = st.columns(2)
 
-with column1:
-
+with col1:
     model_name = st.selectbox(
         "Reconhecimento",
         [
@@ -2350,8 +1771,7 @@ with column1:
         index=0,
     )
 
-with column2:
-
+with col2:
     quality = st.selectbox(
         "Qualidade",
         [
@@ -2364,32 +1784,24 @@ with column2:
 
 st.selectbox(
     "Resolução",
-    [
-        "720 × 1280",
-    ],
+    ["720 × 1280"],
     index=0,
     disabled=True,
 )
 
 
 try:
-
-    fonts_available = (
-        local_fonts()
-    )
+    fonts_available = local_fonts()
 
     st.caption(
         f"Fontes locais disponíveis: "
         f"{len(fonts_available)} · "
+        f"variação palavra por palavra · "
         f"sem download de fontes"
     )
 
 except Exception as exc:
-
-    st.error(
-        str(exc)
-    )
-
+    st.error(str(exc))
     st.stop()
 
 
@@ -2404,11 +1816,9 @@ if st.button(
 ):
 
     if not audio:
-
         st.error(
             "Envie a música primeiro."
         )
-
         st.stop()
 
     temp_dir = Path(
@@ -2418,39 +1828,30 @@ if st.button(
     )
 
     status = st.empty()
-
-    progress = st.progress(
-        0
-    )
+    progress = st.progress(0)
 
     try:
 
         # ----------------------------------------------------
-        # ARQUIVO ORIGINAL
+        # ARQUIVO
         # ----------------------------------------------------
 
         input_path = (
             temp_dir
-            / safe_filename(
-                audio.name
-            )
+            / safe_filename(audio.name)
         )
 
         input_path.write_bytes(
             audio.getbuffer()
         )
 
-        duration, has_audio = (
-            media_info(
-                input_path
-            )
+        duration, has_audio = media_info(
+            input_path
         )
 
         if not has_audio:
-
             raise RuntimeError(
-                "O arquivo enviado "
-                "não possui áudio."
+                "O arquivo não possui áudio."
             )
 
         # ----------------------------------------------------
@@ -2458,7 +1859,6 @@ if st.button(
         # ----------------------------------------------------
 
         try:
-
             (
                 segments,
                 asr_words,
@@ -2474,17 +1874,14 @@ if st.button(
         except Exception as first_error:
 
             if model_name == "small":
-
                 raise RuntimeError(
-                    "Falha na transcrição: "
+                    f"Falha na transcrição: "
                     f"{first_error}"
                 )
 
             status.warning(
-                "O modelo escolhido "
-                "falhou. Tentando "
-                "small para manter "
-                "o Streamlit leve..."
+                "O modelo escolhido falhou. "
+                "Tentando small..."
             )
 
             (
@@ -2499,19 +1896,14 @@ if st.button(
 
             used_model = "small"
 
-        if (
-            not segments
-            and not asr_words
-        ):
-
+        if not segments and not asr_words:
             raise RuntimeError(
-                "O reconhecimento "
-                "não encontrou "
+                "O reconhecimento não encontrou "
                 "segmentos nem palavras."
             )
 
         # ----------------------------------------------------
-        # FIM REAL DA VOZ
+        # FIM DA VOZ
         # ----------------------------------------------------
 
         last_asr_word = max(
@@ -2522,26 +1914,21 @@ if st.button(
             default=0.0,
         )
 
-        if last_asr_word > 0:
-
-            sung_end = min(
+        sung_end = (
+            min(
                 duration,
-                last_asr_word
-                + 0.65,
+                last_asr_word + 0.65,
             )
-
-        else:
-
-            sung_end = duration
+            if last_asr_word > 0
+            else duration
+        )
 
         # ----------------------------------------------------
-        # CONSTRUÇÃO DAS CENAS
+        # LETRA COM TIMESTAMPS
         # ----------------------------------------------------
 
         timed = (
-            parse_timed_lyrics(
-                lyrics
-            )
+            parse_timed_lyrics(lyrics)
             if lyrics.strip()
             else []
         )
@@ -2554,105 +1941,69 @@ if st.button(
         )
 
         if not scenes:
-
             raise RuntimeError(
-                "Não foi possível "
-                "criar as legendas. "
-                "Use a letra com "
-                "timestamps."
+                "Não foi possível criar as legendas."
             )
 
         # ----------------------------------------------------
-        # PREPARA LAYOUT
+        # PREPARAÇÃO
         # ----------------------------------------------------
 
-        for i, scene in enumerate(
-            scenes
-        ):
-
+        for i, scene in enumerate(scenes):
             prepare_scene(
                 scene,
                 i,
                 fonts_available,
             )
 
-        total_rendered_words = sum(
+        total_words = sum(
             len(scene["words"])
             for scene in scenes
-        )
-
-        first_caption = (
-            scenes[0]["text"]
-        )
-
-        last_caption = (
-            scenes[-1]["text"]
         )
 
         # ----------------------------------------------------
         # DIAGNÓSTICO
         # ----------------------------------------------------
 
-        st.subheader(
-            "Diagnóstico"
-        )
+        st.subheader("Diagnóstico")
 
-        diag1, diag2 = (
-            st.columns(2)
-        )
+        d1, d2 = st.columns(2)
 
-        with diag1:
-
+        with d1:
             st.write(
-                f"**Duração do arquivo:** "
-                f"{duration:.2f}s"
+                f"**Duração:** {duration:.2f}s"
+            )
+            st.write(
+                f"**Fim detectado:** {sung_end:.2f}s"
+            )
+            st.write(
+                f"**Segmentos:** {len(segments)}"
+            )
+            st.write(
+                f"**Palavras:** {len(asr_words)}"
             )
 
+        with d2:
             st.write(
-                f"**Fim detectado:** "
-                f"{sung_end:.2f}s"
+                f"**Frases:** {len(scenes)}"
             )
-
             st.write(
-                f"**Segmentos reconhecidos:** "
-                f"{len(segments)}"
+                f"**Palavras renderizadas:** {total_words}"
             )
-
             st.write(
-                f"**Palavras reconhecidas:** "
-                f"{len(asr_words)}"
+                f"**Primeira:** {scenes[0]['text']}"
             )
-
-        with diag2:
-
             st.write(
-                f"**Frases renderizadas:** "
-                f"{len(scenes)}"
-            )
-
-            st.write(
-                f"**Palavras renderizadas:** "
-                f"{total_rendered_words}"
-            )
-
-            st.write(
-                f"**Primeira legenda:** "
-                f"{first_caption}"
-            )
-
-            st.write(
-                f"**Última legenda:** "
-                f"{last_caption}"
+                f"**Última:** {scenes[-1]['text']}"
             )
 
         st.write(
-            f"**Modelo utilizado:** "
-            f"{used_model}"
-            f" · idioma: {language}"
+            f"**Modelo:** {used_model} · "
+            f"idioma: {language}"
         )
 
         # ----------------------------------------------------
-        # RENDERIZAÇÃO
+        # RENDER
         # ----------------------------------------------------
 
         output_path = (
@@ -2660,75 +2011,58 @@ if st.button(
             / "lyric_ai_final.mp4"
         )
 
-        (
-            final_end,
-            rendered_frames,
-        ) = render_video(
-            input_path,
-            scenes,
-            output_path,
-            quality,
-            progress,
+        final_duration, rendered_frames = (
+            render_video(
+                input_path,
+                scenes,
+                output_path,
+                quality,
+                progress,
+            )
         )
 
         # ----------------------------------------------------
-        # VALIDAÇÃO FINAL
+        # VALIDAÇÃO
         # ----------------------------------------------------
 
         if (
             not output_path.exists()
-            or output_path.stat().st_size
-            < 10000
+            or output_path.stat().st_size < 10000
         ):
-
             raise RuntimeError(
-                "O MP4 final não foi "
-                "criado corretamente."
+                "O MP4 final não foi criado corretamente."
             )
 
-        final_duration, final_audio = (
-            media_info(
-                output_path
-            )
+        final_info_duration, final_audio = media_info(
+            output_path
         )
 
         if not final_audio:
-
             raise RuntimeError(
-                "O MP4 final foi "
-                "criado sem áudio."
+                "O MP4 final foi criado sem áudio."
             )
 
         if rendered_frames <= 0:
-
             raise RuntimeError(
-                "Nenhuma legenda "
-                "foi efetivamente "
-                "renderizada."
+                "Nenhuma legenda foi renderizada."
             )
 
         st.success(
             f"Vídeo pronto · "
-            f"{final_duration:.2f}s · "
+            f"{final_info_duration:.2f}s · "
             f"frames com legenda: "
             f"{rendered_frames} · "
             f"áudio: OK"
         )
 
-        video_bytes = (
-            output_path.read_bytes()
-        )
+        video_bytes = output_path.read_bytes()
 
-        st.video(
-            video_bytes
-        )
+        st.video(video_bytes)
 
         st.download_button(
             "⬇️ BAIXAR MP4",
             data=video_bytes,
-            file_name=(
-                "lyric_ai_video.mp4"
-            ),
+            file_name="lyric_ai_video.mp4",
             mime="video/mp4",
             use_container_width=True,
         )
@@ -2736,13 +2070,10 @@ if st.button(
     except Exception as exc:
 
         st.error(
-            "A renderização não "
-            "foi concluída."
+            "A renderização não foi concluída."
         )
 
-        st.exception(
-            exc
-        )
+        st.exception(exc)
 
     finally:
 
