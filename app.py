@@ -478,4 +478,4 @@ if st.button("ð CRIAR LYRIC VIDEO",type="primary",use_container_width=Tru
     except Exception as e:
         st.error("A geraÃ§Ã£o falhou.")
         st.code(str(e))
-    # keep tmp alive for this Streamlit run
+    # keep tmp alive for this Streamlit run 
