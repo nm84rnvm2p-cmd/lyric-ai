@@ -17,19 +17,31 @@ from PIL import Image, ImageDraw, ImageFont
 # CONFIGURAÇÃO
 # ============================================================
 
-APP_VERSION = "19.0-EXACT-TIMESTAMPS"
+APP_VERSION = "19.0-EXACT-TIMESTAMP-FAST-FADE"
 
 W = 720
 H = 1280
 FPS = 20
 
-# Tempo do fade-in de cada palavra
-WORD_FADE = 0.12
+# ============================================================
+# FADE DE ENTRADA DAS PALAVRAS
+#
+# Antes estava lento.
+# Agora cada palavra faz fade-in muito rápido.
+# ============================================================
 
-# Transição entre fundos
+WORD_FADE = 0.06
+
+# ============================================================
+# TRANSIÇÃO ENTRE FUNDOS
+# ============================================================
+
 BACKGROUND_FADE = 0.20
 
-# Cor azul
+# ============================================================
+# COR AZUL
+# ============================================================
+
 ROYAL = (45, 92, 255)
 
 BLACK = (0, 0, 0)
@@ -86,8 +98,8 @@ FONT_CANDIDATES = [
 
     (
         "Tinos",
-        "/usr/share/fonts/truetype/liberation2/"
-        "LiberationSerif-Bold.ttf",
+        "/usr/share/fonts/truetype/croscore/"
+        "Tinos-Bold.ttf",
     ),
 
 ]
@@ -312,22 +324,22 @@ def estimate_bpm(audio_path):
         ):
             return 100.0
 
-        audio_data = np.frombuffer(
+        audio = np.frombuffer(
             result.stdout,
             dtype=np.int16,
         ).astype(
             np.float32
         )
 
-        if len(audio_data) < 8000:
+        if len(audio) < 8000:
             return 100.0
 
-        audio_data /= 32768.0
+        audio /= 32768.0
 
         block = 400
 
         count = (
-            len(audio_data)
+            len(audio)
             // block
         )
 
@@ -341,7 +353,7 @@ def estimate_bpm(audio_path):
 
         for i in range(count):
 
-            section = audio_data[
+            section = audio[
                 i * block:
                 (i + 1) * block
             ]
@@ -628,9 +640,9 @@ def draw_intro_frame(
         ),
     )
 
-    # --------------------------------------------------------
+    # ========================================================
     # LOGO
-    # --------------------------------------------------------
+    # ========================================================
 
     logo = resize_logo(
         logo
@@ -708,9 +720,9 @@ def draw_intro_frame(
                 ),
             )
 
-    # --------------------------------------------------------
+    # ========================================================
     # CÍRCULO BRANCO
-    # --------------------------------------------------------
+    # ========================================================
 
     circle_start = 0.25
 
@@ -966,7 +978,10 @@ def distribute_words(
             {
                 "word": token,
                 "start": word_start,
-                "end": word_end,
+                "end": max(
+                    word_start + 0.01,
+                    word_end,
+                ),
             }
         )
 
@@ -1007,23 +1022,20 @@ def similarity(
 
 
 # ============================================================
-# PALAVRAS DENTRO DA FRASE
+# ALINHAMENTO DO WHISPER
+#
+# ESTA FUNÇÃO CONTINUA EXISTINDO PARA O MODO AUTOMÁTICO.
 #
 # IMPORTANTE:
-#
-# Os timestamps da LETRA são soberanos.
-#
-# O Whisper NÃO pode deslocar o início ou o
-# final da frase.
-#
-# As palavras são distribuídas dentro do
-# intervalo EXATO fornecido pelo usuário.
+# quando o usuário fornece timestamps,
+# ela NÃO será utilizada.
 # ============================================================
 
-def create_exact_phrase_words(
+def align_phrase(
     text,
     start,
     end,
+    asr_words,
 ):
 
     tokens = re.findall(
@@ -1034,76 +1046,185 @@ def create_exact_phrase_words(
     if not tokens:
         return []
 
-    duration = (
-        end - start
-    )
+    candidates = [
+        word
+        for word in asr_words
+        if (
+            word["end"]
+            > start - 0.20
+        )
+        and (
+            word["start"]
+            < end + 0.20
+        )
+    ]
 
-    if duration <= 0:
-        return []
+    result = [
+        None
+        for _ in tokens
+    ]
 
-    count = len(tokens)
-
-    # Pequeno espaço inicial para o primeiro
-    # fade começar imediatamente depois do
-    # timestamp da frase.
-
-    if count == 1:
-
-        return [
-            {
-                "word": tokens[0],
-                "start": start,
-                "end": end,
-            }
-        ]
-
-    # Distribuição progressiva.
-    #
-    # A primeira palavra começa exatamente
-    # no timestamp da frase.
-    #
-    # A última palavra entra antes do final,
-    # garantindo que TODA a frase esteja
-    # visível antes de desaparecer.
-
-    reveal_window = max(
-        0.0,
-        duration - 0.08,
-    )
-
-    result = []
+    used = set()
 
     for i, token in enumerate(
         tokens
     ):
 
-        ratio = (
-            i
-            / max(
-                1,
-                count - 1,
+        best_index = None
+        best_score = 0.0
+
+        for j, candidate in enumerate(
+            candidates
+        ):
+
+            if j in used:
+                continue
+
+            score = similarity(
+                token,
+                candidate["word"],
             )
+
+            if score > best_score:
+
+                best_score = score
+                best_index = j
+
+        if (
+            best_index is not None
+            and best_score >= 0.42
+        ):
+
+            candidate = candidates[
+                best_index
+            ]
+
+            used.add(
+                best_index
+            )
+
+            result[i] = {
+                "word": token,
+                "start": max(
+                    start,
+                    min(
+                        end,
+                        candidate["start"],
+                    ),
+                ),
+                "end": max(
+                    start,
+                    min(
+                        end,
+                        candidate["end"],
+                    ),
+                ),
+            }
+
+    known = [
+        i
+        for i, item in enumerate(
+            result
+        )
+        if item is not None
+    ]
+
+    for i in range(
+        len(tokens)
+    ):
+
+        if result[i] is not None:
+            continue
+
+        previous = max(
+            (
+                k
+                for k in known
+                if k < i
+            ),
+            default=-1,
+        )
+
+        following = min(
+            (
+                k
+                for k in known
+                if k > i
+            ),
+            default=len(tokens),
+        )
+
+        left = (
+            result[
+                previous
+            ]["end"]
+            if previous >= 0
+            else start
+        )
+
+        right = (
+            result[
+                following
+            ]["start"]
+            if following < len(tokens)
+            else end
+        )
+
+        count = max(
+            1,
+            following - previous,
         )
 
         word_start = (
-            start
-            + reveal_window
-            * ratio
+            left
+            + (
+                right - left
+            )
+            * (
+                (
+                    i
+                    - previous
+                    - 1
+                )
+                / count
+            )
         )
 
-        # As palavras ficam conceitualmente
-        # ativas até o final da frase.
-        #
-        # O end não é usado para apagar
-        # individualmente a palavra.
-
-        result.append(
-            {
-                "word": token,
-                "start": word_start,
-                "end": end,
-            }
+        word_end = (
+            left
+            + (
+                right - left
+            )
+            * (
+                (
+                    i
+                    - previous
+                )
+                / count
+            )
         )
+
+        word_start = max(
+            start,
+            min(
+                end,
+                word_start,
+            ),
+        )
+
+        word_end = max(
+            word_start + 0.01,
+            min(
+                end,
+                word_end,
+            ),
+        )
+
+        result[i] = {
+            "word": tokens[i],
+            "start": word_start,
+            "end": word_end,
+        }
 
     return result
 
@@ -1248,9 +1369,13 @@ def build_scenes(
     scenes = []
 
     # ========================================================
-    # LETRA COM TIMESTAMPS
+    # MODO COM TIMESTAMPS
     #
-    # ESTA É A PRIORIDADE MÁXIMA.
+    # AQUI ESTÁ A PRINCIPAL CORREÇÃO.
+    #
+    # O Whisper NÃO altera mais os tempos.
+    #
+    # O intervalo fornecido pelo usuário é absoluto.
     # ========================================================
 
     if timed:
@@ -1268,10 +1393,6 @@ def build_scenes(
 
             if start >= sung_end:
                 break
-
-            # ------------------------------------------------
-            # END EXATO DA FRASE
-            # ------------------------------------------------
 
             if (
                 line.get("end")
@@ -1292,7 +1413,7 @@ def build_scenes(
                     < len(timed)
                 ):
 
-                    next_start = float(
+                    next_start = (
                         timed[
                             i + 1
                         ]["start"]
@@ -1303,7 +1424,7 @@ def build_scenes(
                     next_start = sung_end
 
                 end = min(
-                    next_start,
+                    float(next_start),
                     sung_end,
                 )
 
@@ -1313,22 +1434,19 @@ def build_scenes(
             ):
                 continue
 
-            # ------------------------------------------------
-            # PALAVRAS:
+            # =================================================
+            # IMPORTANTE:
             #
-            # NÃO usa os timestamps do Whisper
-            # para atrasar a frase.
+            # NÃO usamos align_phrase().
             #
-            # O intervalo fornecido pelo usuário
-            # controla tudo.
-            # ------------------------------------------------
+            # As palavras são distribuídas diretamente
+            # entre o início e o fim fornecidos pelo usuário.
+            # =================================================
 
-            words = (
-                create_exact_phrase_words(
-                    line["text"],
-                    start,
-                    end,
-                )
+            words = distribute_words(
+                line["text"],
+                start,
+                end,
             )
 
             if words:
@@ -1341,16 +1459,19 @@ def build_scenes(
                             line["text"]
                         ),
                         "words": words,
+
+                        # Guarda informação de que
+                        # esta frase veio de timestamp manual.
+                        "exact_timestamp": True,
                     }
                 )
 
         return scenes
 
     # ========================================================
-    # SEM TIMESTAMPS
+    # MODO AUTOMÁTICO
     #
-    # Aqui o Whisper continua sendo usado
-    # normalmente.
+    # Somente aqui o Whisper controla o tempo.
     # ========================================================
 
     for segment in segments:
@@ -1375,13 +1496,24 @@ def build_scenes(
         ):
             continue
 
-        words = create_exact_phrase_words(
-            segment["text"],
-            start,
-            end,
-        )
+        segment_words = [
+            dict(word)
+            for word in asr_words
+            if (
+                word["end"] > start
+                and word["start"] < end
+            )
+        ]
 
-        if words:
+        if not segment_words:
+
+            segment_words = distribute_words(
+                segment["text"],
+                start,
+                end,
+            )
+
+        if segment_words:
 
             scenes.append(
                 {
@@ -1390,7 +1522,9 @@ def build_scenes(
                     "text": clean_text(
                         segment["text"]
                     ),
-                    "words": words,
+                    "words": segment_words,
+
+                    "exact_timestamp": False,
                 }
             )
 
@@ -1475,7 +1609,7 @@ def text_size(
 
 
 # ============================================================
-# VARIAÇÃO DE FONTE
+# FONTES — VARIAÇÃO PALAVRA POR PALAVRA
 # ============================================================
 
 def choose_word_font(
@@ -1929,7 +2063,6 @@ def prepare_scene(
                     item["text"],
                 )
 
-            # Refaz as linhas
             rows = []
 
             current = []
@@ -2079,10 +2212,6 @@ def prepare_scene(
                 + gap_y
             )
 
-    # ========================================================
-    # CONGELA POSIÇÕES
-    # ========================================================
-
     scene["mode"] = mode
 
     scene["placements"] = (
@@ -2125,14 +2254,6 @@ def scene_at_time(
     ):
 
         index -= 1
-
-    # Fora de qualquer frase
-    if (
-        t < scenes[index]["start"]
-        or t >= scenes[index]["end"]
-    ):
-
-        return -1
 
     return index
 
@@ -2276,17 +2397,6 @@ def draw_text_with_alpha(
 
 # ============================================================
 # FRAME
-#
-# NOVA REGRA:
-#
-# A palavra entra com fade-in.
-#
-# Depois que entra, ela permanece.
-#
-# Nenhuma palavra é apagada individualmente.
-#
-# Toda a frase desaparece quando chega ao
-# timestamp END da frase.
 # ============================================================
 
 def draw_frame(
@@ -2305,9 +2415,9 @@ def draw_frame(
         current_background
     )
 
-    # --------------------------------------------------------
-    # TRANSIÇÃO DE FUNDO
-    # --------------------------------------------------------
+    # ========================================================
+    # TRANSIÇÃO PRETO ↔ BRANCO
+    # ========================================================
 
     if (
         scene_index > 0
@@ -2354,15 +2464,23 @@ def draw_frame(
         else WHITE
     )
 
+    rendered = False
+
     # ========================================================
     # PALAVRAS
+    #
+    # Cada palavra entra no seu próprio momento.
+    #
+    # Depois do fade:
+    # permanece 100% visível.
+    #
+    # Não existe desaparecimento individual.
     # ========================================================
 
     for item in scene[
         "placements"
     ]:
 
-        # A palavra ainda não entrou
         if (
             time_position
             < item["start"]
@@ -2370,9 +2488,11 @@ def draw_frame(
 
             continue
 
-        # ----------------------------------------------------
-        # FADE-IN
-        # ----------------------------------------------------
+        rendered = True
+
+        # ====================================================
+        # FADE-IN MUITO RÁPIDO
+        # ====================================================
 
         age = (
             time_position
@@ -2387,19 +2507,15 @@ def draw_frame(
 
             alpha = int(
                 255
-                * max(
-                    0.0,
-                    min(
-                        1.0,
-                        age
-                        / WORD_FADE,
-                    ),
+                * (
+                    age
+                    / WORD_FADE
                 )
             )
 
-        # ----------------------------------------------------
+        # ====================================================
         # COR
-        # ----------------------------------------------------
+        # ====================================================
 
         if item["blue"]:
 
@@ -2409,9 +2525,9 @@ def draw_frame(
 
             color = main_color
 
-        # ----------------------------------------------------
+        # ====================================================
         # DESENHA
-        # ----------------------------------------------------
+        # ====================================================
 
         image = draw_text_with_alpha(
             image,
@@ -2421,22 +2537,51 @@ def draw_frame(
         )
 
     # ========================================================
-    # IMPORTANTE:
+    # DESAPARECIMENTO DA FRASE INTEIRA
     #
-    # NÃO existe fade-out individual.
+    # Todas as palavras continuam na tela até o final.
     #
-    # O draw_frame só é chamado para essa
-    # cena enquanto:
-    #
-    # scene.start <= tempo < scene.end
-    #
-    # Portanto, ao atingir scene.end,
-    # a frase inteira deixa de ser desenhada.
+    # Quando chega ao final:
+    # a frase some inteira.
     # ========================================================
+
+    remaining = (
+        scene["end"]
+        - time_position
+    )
+
+    if (
+        rendered
+        and remaining
+        < BACKGROUND_FADE
+    ):
+
+        factor = max(
+            0.0,
+            min(
+                1.0,
+                remaining
+                / BACKGROUND_FADE,
+            ),
+        )
+
+        if factor < 0.999:
+
+            flat = Image.new(
+                "RGB",
+                image.size,
+                background,
+            )
+
+            image = Image.blend(
+                flat,
+                image,
+                factor,
+            )
 
     return (
         image,
-        True,
+        rendered,
     )
 
 
@@ -2458,6 +2603,7 @@ def validate_text_visibility(
         if not scene[
             "placements"
         ]:
+
             continue
 
         first_word = min(
@@ -2470,7 +2616,7 @@ def validate_text_visibility(
             max(
                 scene["start"],
                 first_word["start"]
-                + 0.12,
+                + 0.08,
             )
         )
 
@@ -2563,7 +2709,7 @@ def render_video(
     fonts = local_fonts()
 
     # ========================================================
-    # PREPARA LAYOUT
+    # PREPARA LAYOUT UMA VEZ
     # ========================================================
 
     for i, scene in enumerate(
@@ -2668,6 +2814,10 @@ def render_video(
         stdin=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
+
+    # ========================================================
+    # INTRO
+    # ========================================================
 
     total_duration = final_end
 
@@ -2898,10 +3048,6 @@ st.caption(
 )
 
 
-# ============================================================
-# EXPLICAÇÃO
-# ============================================================
-
 with st.expander(
     "Como usar",
     expanded=False,
@@ -2919,14 +3065,18 @@ Exemplo:
 
 `00:22.900 - 00:26.000 | Céu e mar`
 
-O comportamento das frases é:
+O vídeo possui:
 
-- O timestamp inicial controla exatamente quando a frase começa.
-- As palavras entram progressivamente com fade-in.
-- Cada palavra que entrou permanece na tela.
-- Nenhuma palavra desaparece individualmente.
-- O timestamp final controla exatamente quando a frase inteira desaparece.
-- O Whisper não altera os timestamps fornecidos.
+- intro com logo;
+- círculo expansivo;
+- fade-in rápido palavra por palavra;
+- todas as palavras permanecem na tela;
+- a frase inteira desaparece de uma vez;
+- fontes alternadas;
+- fundo preto/branco;
+- palavras azuis;
+- transição entre fundos;
+- timestamps fornecidos pelo usuário têm prioridade absoluta.
         """
     )
 
@@ -2973,7 +3123,7 @@ audio = st.file_uploader(
 
 
 lyrics = st.text_area(
-    "2. Letra oficial com timestamps",
+    "2. Letra oficial (recomendada)",
     height=230,
     placeholder=(
         "00:11.700 - 00:15.200 | "
@@ -3067,15 +3217,6 @@ if st.button(
 
         st.error(
             "Envie a música primeiro."
-        )
-
-        st.stop()
-
-    if not lyrics.strip():
-
-        st.error(
-            "Cole a letra com timestamps "
-            "para obter a sincronização exata."
         )
 
         st.stop()
@@ -3219,18 +3360,13 @@ if st.button(
         # LETRA
         # ====================================================
 
-        timed = parse_timed_lyrics(
-            lyrics
-        )
-
-        if not timed:
-
-            raise RuntimeError(
-                "Não foi possível interpretar "
-                "os timestamps. Use o formato:\n\n"
-                "00:11.700 - 00:15.200 | "
-                "Texto da frase"
+        timed = (
+            parse_timed_lyrics(
+                lyrics
             )
+            if lyrics.strip()
+            else []
+        )
 
         scenes = build_scenes(
             timed,
@@ -3243,7 +3379,9 @@ if st.button(
 
             raise RuntimeError(
                 "Não foi possível "
-                "criar as legendas."
+                "criar as legendas. "
+                "Use a letra com "
+                "timestamps."
             )
 
         # ====================================================
@@ -3294,134 +3432,92 @@ if st.button(
         # DIAGNÓSTICO
         # ====================================================
 
-        with st.expander(
-            "🤖 Informações e ações da IA",
-            expanded=True,
-        ):
+        st.subheader(
+            "Diagnóstico"
+        )
 
-            st.markdown(
-                "### Análise realizada"
-            )
+        diag1, diag2 = (
+            st.columns(2)
+        )
 
-            diag1, diag2 = (
-                st.columns(2)
-            )
+        with diag1:
 
-            with diag1:
-
-                st.write(
-                    f"**Duração:** "
-                    f"{duration:.2f}s"
-                )
-
-                st.write(
-                    f"**BPM estimado:** "
-                    f"{bpm:.1f}"
-                )
-
-                st.write(
-                    f"**Duração da intro:** "
-                    f"{intro_duration:.2f}s"
-                )
-
-                st.write(
-                    f"**Fim detectado:** "
-                    f"{sung_end:.2f}s"
-                )
-
-                st.write(
-                    f"**Segmentos reconhecidos:** "
-                    f"{len(segments)}"
-                )
-
-                st.write(
-                    f"**Palavras reconhecidas:** "
-                    f"{len(asr_words)}"
-                )
-
-            with diag2:
-
-                st.write(
-                    f"**Frases com timestamp:** "
-                    f"{len(scenes)}"
-                )
-
-                st.write(
-                    f"**Palavras renderizadas:** "
-                    f"{total_rendered_words}"
-                )
-
-                st.write(
-                    f"**Modelo utilizado:** "
-                    f"{used_model}"
-                )
-
-                st.write(
-                    f"**Idioma detectado:** "
-                    f"{language}"
-                )
-
-            st.markdown(
-                "### ⚙️ Regras usadas na criação"
+            st.write(
+                f"**Duração:** "
+                f"{duration:.2f}s"
             )
 
             st.write(
-                "✓ Timestamps fornecidos pelo usuário "
-                "têm prioridade absoluta."
+                f"**BPM estimado:** "
+                f"{bpm:.1f}"
             )
 
             st.write(
-                "✓ O Whisper não desloca o início "
-                "nem o fim das frases."
+                f"**Duração da intro:** "
+                f"{intro_duration:.2f}s"
             )
 
             st.write(
-                "✓ Palavras entram progressivamente "
-                "com fade-in."
+                f"**Fim detectado:** "
+                f"{sung_end:.2f}s"
             )
 
             st.write(
-                "✓ Depois de aparecer, cada palavra "
-                "permanece na tela."
+                f"**Segmentos:** "
+                f"{len(segments)}"
             )
 
             st.write(
-                "✓ Todas as palavras da frase "
-                "desaparecem juntas no timestamp final."
+                f"**Palavras reconhecidas:** "
+                f"{len(asr_words)}"
+            )
+
+        with diag2:
+
+            st.write(
+                f"**Frases:** "
+                f"{len(scenes)}"
             )
 
             st.write(
-                "✓ Fundo preto/branco alternado."
+                f"**Palavras renderizadas:** "
+                f"{total_rendered_words}"
             )
 
             st.write(
-                "✓ Palavras azuis selecionadas "
-                "automaticamente."
+                f"**Primeira legenda:** "
+                f"{first_caption}"
             )
 
             st.write(
-                "✓ Fontes alternadas palavra por palavra."
+                f"**Última legenda:** "
+                f"{last_caption}"
             )
 
-            st.write(
-                "✓ Intro com logo e círculo expansivo."
-            )
+            if timed:
 
-            st.markdown(
-                "### 📝 Primeira frase"
-            )
+                st.write(
+                    "**Sincronização:** "
+                    "TIMESTAMPS EXATOS"
+                )
 
-            st.code(
-                first_caption
-            )
+                st.write(
+                    "**Whisper:** "
+                    "não altera os tempos da letra"
+                )
 
-            st.markdown(
-                "### 📝 Última frase"
-            )
+            else:
 
-            st.code(
-                last_caption
-            )
+                st.write(
+                    "**Sincronização:** "
+                    "Whisper automático"
+                )
+
+        st.write(
+            f"**Modelo:** "
+            f"{used_model}"
+            f" · idioma: {language}"
+        )
 
         # ====================================================
         # RENDER
