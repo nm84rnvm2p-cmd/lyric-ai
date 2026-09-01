@@ -17,19 +17,13 @@ from PIL import Image, ImageDraw, ImageFont
 # CONFIGURAÇÃO
 # ============================================================
 
-APP_VERSION = "19.0-FADE-IN-PHRASE"
+APP_VERSION = "19.0-EXACT-TIMESTAMPS"
 
 W = 720
 H = 1280
 FPS = 20
 
-# ============================================================
-# FADE DE ENTRADA DAS PALAVRAS
-#
-# Cada palavra começa no seu timestamp e faz fade in.
-# Depois de aparecer, permanece na tela até o FINAL DA FRASE.
-# ============================================================
-
+# Tempo do fade-in de cada palavra
 WORD_FADE = 0.12
 
 # Transição entre fundos
@@ -92,8 +86,8 @@ FONT_CANDIDATES = [
 
     (
         "Tinos",
-        "/usr/share/fonts/truetype/croscore/"
-        "Tinos-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation2/"
+        "LiberationSerif-Bold.ttf",
     ),
 
 ]
@@ -280,16 +274,6 @@ def media_info(path):
 
 def estimate_bpm(audio_path):
 
-    """
-    Estimativa leve de BPM.
-
-    Não utiliza librosa.
-    Não adiciona uma dependência pesada.
-
-    Analisa somente os primeiros segundos
-    da música e usa autocorrelação da energia.
-    """
-
     try:
 
         import numpy as np
@@ -328,22 +312,22 @@ def estimate_bpm(audio_path):
         ):
             return 100.0
 
-        audio = np.frombuffer(
+        audio_data = np.frombuffer(
             result.stdout,
             dtype=np.int16,
         ).astype(
             np.float32
         )
 
-        if len(audio) < 8000:
+        if len(audio_data) < 8000:
             return 100.0
 
-        audio /= 32768.0
+        audio_data /= 32768.0
 
         block = 400
 
         count = (
-            len(audio)
+            len(audio_data)
             // block
         )
 
@@ -357,7 +341,7 @@ def estimate_bpm(audio_path):
 
         for i in range(count):
 
-            section = audio[
+            section = audio_data[
                 i * block:
                 (i + 1) * block
             ]
@@ -402,6 +386,7 @@ def estimate_bpm(audio_path):
         )
 
         if max_lag >= len(envelope):
+
             max_lag = (
                 len(envelope) - 1
             )
@@ -435,7 +420,6 @@ def estimate_bpm(audio_path):
                 best_lag = lag
 
         if not best_lag:
-
             return 100.0
 
         bpm = (
@@ -473,19 +457,6 @@ def calculate_intro_duration(
     bpm,
     first_lyric_start,
 ):
-
-    """
-    Intro baseada em 2 batidas.
-
-    Música rápida:
-    intro menor.
-
-    Música lenta:
-    intro maior.
-
-    Quando existe timestamp da primeira
-    frase, a intro tenta terminar antes dela.
-    """
 
     bpm = max(
         70.0,
@@ -995,10 +966,7 @@ def distribute_words(
             {
                 "word": token,
                 "start": word_start,
-                "end": max(
-                    word_start + 0.06,
-                    word_end,
-                ),
+                "end": word_end,
             }
         )
 
@@ -1039,14 +1007,23 @@ def similarity(
 
 
 # ============================================================
-# ALINHAMENTO
+# PALAVRAS DENTRO DA FRASE
+#
+# IMPORTANTE:
+#
+# Os timestamps da LETRA são soberanos.
+#
+# O Whisper NÃO pode deslocar o início ou o
+# final da frase.
+#
+# As palavras são distribuídas dentro do
+# intervalo EXATO fornecido pelo usuário.
 # ============================================================
 
-def align_phrase(
+def create_exact_phrase_words(
     text,
     start,
     end,
-    asr_words,
 ):
 
     tokens = re.findall(
@@ -1057,185 +1034,76 @@ def align_phrase(
     if not tokens:
         return []
 
-    candidates = [
-        word
-        for word in asr_words
-        if (
-            word["end"]
-            > start - 0.20
-        )
-        and (
-            word["start"]
-            < end + 0.20
-        )
-    ]
+    duration = (
+        end - start
+    )
 
-    result = [
-        None
-        for _ in tokens
-    ]
+    if duration <= 0:
+        return []
 
-    used = set()
+    count = len(tokens)
+
+    # Pequeno espaço inicial para o primeiro
+    # fade começar imediatamente depois do
+    # timestamp da frase.
+
+    if count == 1:
+
+        return [
+            {
+                "word": tokens[0],
+                "start": start,
+                "end": end,
+            }
+        ]
+
+    # Distribuição progressiva.
+    #
+    # A primeira palavra começa exatamente
+    # no timestamp da frase.
+    #
+    # A última palavra entra antes do final,
+    # garantindo que TODA a frase esteja
+    # visível antes de desaparecer.
+
+    reveal_window = max(
+        0.0,
+        duration - 0.08,
+    )
+
+    result = []
 
     for i, token in enumerate(
         tokens
     ):
 
-        best_index = None
-        best_score = 0.0
-
-        for j, candidate in enumerate(
-            candidates
-        ):
-
-            if j in used:
-                continue
-
-            score = similarity(
-                token,
-                candidate["word"],
+        ratio = (
+            i
+            / max(
+                1,
+                count - 1,
             )
-
-            if score > best_score:
-
-                best_score = score
-                best_index = j
-
-        if (
-            best_index is not None
-            and best_score >= 0.42
-        ):
-
-            candidate = candidates[
-                best_index
-            ]
-
-            used.add(
-                best_index
-            )
-
-            result[i] = {
-                "word": token,
-                "start": max(
-                    start,
-                    min(
-                        end,
-                        candidate["start"],
-                    ),
-                ),
-                "end": max(
-                    start,
-                    min(
-                        end,
-                        candidate["end"],
-                    ),
-                ),
-            }
-
-    known = [
-        i
-        for i, item in enumerate(
-            result
-        )
-        if item is not None
-    ]
-
-    for i in range(
-        len(tokens)
-    ):
-
-        if result[i] is not None:
-            continue
-
-        previous = max(
-            (
-                k
-                for k in known
-                if k < i
-            ),
-            default=-1,
-        )
-
-        following = min(
-            (
-                k
-                for k in known
-                if k > i
-            ),
-            default=len(tokens),
-        )
-
-        left = (
-            result[
-                previous
-            ]["end"]
-            if previous >= 0
-            else start
-        )
-
-        right = (
-            result[
-                following
-            ]["start"]
-            if following < len(tokens)
-            else end
-        )
-
-        count = max(
-            1,
-            following - previous,
         )
 
         word_start = (
-            left
-            + (
-                right - left
-            )
-            * (
-                (
-                    i
-                    - previous
-                    - 1
-                )
-                / count
-            )
+            start
+            + reveal_window
+            * ratio
         )
 
-        word_end = (
-            left
-            + (
-                right - left
-            )
-            * (
-                (
-                    i
-                    - previous
-                )
-                / count
-            )
-        )
+        # As palavras ficam conceitualmente
+        # ativas até o final da frase.
+        #
+        # O end não é usado para apagar
+        # individualmente a palavra.
 
-        word_start = max(
-            start,
-            min(
-                end,
-                word_start,
-            ),
+        result.append(
+            {
+                "word": token,
+                "start": word_start,
+                "end": end,
+            }
         )
-
-        word_end = max(
-            word_start + 0.06,
-            min(
-                end,
-                word_end,
-            ),
-        )
-
-        result[i] = {
-            "word": tokens[i],
-            "start": word_start,
-            "end": word_end,
-        }
 
     return result
 
@@ -1379,6 +1247,12 @@ def build_scenes(
 
     scenes = []
 
+    # ========================================================
+    # LETRA COM TIMESTAMPS
+    #
+    # ESTA É A PRIORIDADE MÁXIMA.
+    # ========================================================
+
     if timed:
 
         for i, line in enumerate(
@@ -1394,6 +1268,10 @@ def build_scenes(
 
             if start >= sung_end:
                 break
+
+            # ------------------------------------------------
+            # END EXATO DA FRASE
+            # ------------------------------------------------
 
             if (
                 line.get("end")
@@ -1414,7 +1292,7 @@ def build_scenes(
                     < len(timed)
                 ):
 
-                    next_start = (
+                    next_start = float(
                         timed[
                             i + 1
                         ]["start"]
@@ -1425,7 +1303,7 @@ def build_scenes(
                     next_start = sung_end
 
                 end = min(
-                    float(next_start),
+                    next_start,
                     sung_end,
                 )
 
@@ -1435,20 +1313,23 @@ def build_scenes(
             ):
                 continue
 
-            words = align_phrase(
-                line["text"],
-                start,
-                end,
-                asr_words,
-            )
+            # ------------------------------------------------
+            # PALAVRAS:
+            #
+            # NÃO usa os timestamps do Whisper
+            # para atrasar a frase.
+            #
+            # O intervalo fornecido pelo usuário
+            # controla tudo.
+            # ------------------------------------------------
 
-            if not words:
-
-                words = distribute_words(
+            words = (
+                create_exact_phrase_words(
                     line["text"],
                     start,
                     end,
                 )
+            )
 
             if words:
 
@@ -1464,6 +1345,13 @@ def build_scenes(
                 )
 
         return scenes
+
+    # ========================================================
+    # SEM TIMESTAMPS
+    #
+    # Aqui o Whisper continua sendo usado
+    # normalmente.
+    # ========================================================
 
     for segment in segments:
 
@@ -1487,24 +1375,13 @@ def build_scenes(
         ):
             continue
 
-        segment_words = [
-            dict(word)
-            for word in asr_words
-            if (
-                word["end"] > start
-                and word["start"] < end
-            )
-        ]
+        words = create_exact_phrase_words(
+            segment["text"],
+            start,
+            end,
+        )
 
-        if not segment_words:
-
-            segment_words = distribute_words(
-                segment["text"],
-                start,
-                end,
-            )
-
-        if segment_words:
+        if words:
 
             scenes.append(
                 {
@@ -1513,7 +1390,7 @@ def build_scenes(
                     "text": clean_text(
                         segment["text"]
                     ),
-                    "words": segment_words,
+                    "words": words,
                 }
             )
 
@@ -1598,7 +1475,7 @@ def text_size(
 
 
 # ============================================================
-# FONTES — VARIAÇÃO PALAVRA POR PALAVRA
+# VARIAÇÃO DE FONTE
 # ============================================================
 
 def choose_word_font(
@@ -1609,18 +1486,6 @@ def choose_word_font(
 
     if len(fonts) == 1:
         return fonts[0][1]
-
-    """
-    A fonte muda a cada palavra.
-
-    Dentro da mesma frase:
-
-    palavra 1 → fonte A
-    palavra 2 → fonte B
-    palavra 3 → fonte C
-    palavra 4 → fonte D
-    ...
-    """
 
     position = (
         scene_index * 3
@@ -1683,14 +1548,6 @@ def choose_blue_indexes(
     if word_count <= 0:
         return set()
 
-    """
-    Aproximadamente 35–40% das palavras
-    podem receber azul.
-
-    Não existe fundo azul.
-    É SOMENTE a cor da palavra.
-    """
-
     indexes = set()
 
     for i in range(
@@ -1730,7 +1587,6 @@ def prepare_scene(
 
     count = len(words)
 
-    # 50% horizontal / 50% vertical
     if scene_index % 2 == 0:
 
         mode = "horizontal"
@@ -1906,4 +1762,1765 @@ def prepare_scene(
                 - total_height
             )
             / 2,
-       
+        )
+
+        for item in items:
+
+            x = (
+                W
+                - item["tw"]
+            ) / 2
+
+            placements.append(
+                {
+                    **item,
+                    "x": int(x),
+                    "y": int(y),
+                }
+            )
+
+            y += (
+                item["th"]
+                + gap
+            )
+
+    # ========================================================
+    # HORIZONTAL
+    # ========================================================
+
+    else:
+
+        rows = []
+
+        current = []
+
+        row_width = 0
+
+        space = 14
+
+        target = (
+            2
+            if count % 3
+            else 3
+        )
+
+        for item in items:
+
+            required = (
+                item["tw"]
+                if not current
+                else (
+                    row_width
+                    + space
+                    + item["tw"]
+                )
+            )
+
+            if (
+                current
+                and (
+                    len(current)
+                    >= target
+                    or required
+                    > safe_width
+                )
+            ):
+
+                rows.append(
+                    current
+                )
+
+                current = []
+
+                row_width = 0
+
+            current.append(
+                item
+            )
+
+            if len(current) == 1:
+
+                row_width = (
+                    item["tw"]
+                )
+
+            else:
+
+                row_width += (
+                    space
+                    + item["tw"]
+                )
+
+            if (
+                len(current)
+                == target
+            ):
+
+                rows.append(
+                    current
+                )
+
+                current = []
+
+                row_width = 0
+
+        if current:
+
+            rows.append(
+                current
+            )
+
+        gap_y = 18
+
+        total_height = (
+            sum(
+                max(
+                    item["th"]
+                    for item in row
+                )
+                for row in rows
+            )
+            + gap_y
+            * max(
+                0,
+                len(rows) - 1,
+            )
+        )
+
+        if (
+            total_height
+            > safe_height
+            and items
+        ):
+
+            scale = max(
+                0.55,
+                safe_height
+                / total_height,
+            )
+
+            for item in items:
+
+                new_size = max(
+                    30,
+                    int(
+                        item[
+                            "font"
+                        ].size
+                        * scale
+                    ),
+                )
+
+                item["font"] = (
+                    load_font(
+                        item[
+                            "font_path"
+                        ],
+                        new_size,
+                    )
+                )
+
+                (
+                    item["tw"],
+                    item["th"],
+                    item["bbox"],
+                ) = text_size(
+                    item["font"],
+                    item["text"],
+                )
+
+            # Refaz as linhas
+            rows = []
+
+            current = []
+
+            row_width = 0
+
+            for item in items:
+
+                required = (
+                    item["tw"]
+                    if not current
+                    else (
+                        row_width
+                        + space
+                        + item["tw"]
+                    )
+                )
+
+                if (
+                    current
+                    and (
+                        len(current)
+                        >= target
+                        or required
+                        > safe_width
+                    )
+                ):
+
+                    rows.append(
+                        current
+                    )
+
+                    current = []
+
+                    row_width = 0
+
+                current.append(
+                    item
+                )
+
+                if len(current) == 1:
+
+                    row_width = (
+                        item["tw"]
+                    )
+
+                else:
+
+                    row_width += (
+                        space
+                        + item["tw"]
+                    )
+
+                if (
+                    len(current)
+                    == target
+                ):
+
+                    rows.append(
+                        current
+                    )
+
+                    current = []
+
+                    row_width = 0
+
+            if current:
+
+                rows.append(
+                    current
+                )
+
+            total_height = (
+                sum(
+                    max(
+                        item["th"]
+                        for item in row
+                    )
+                    for row in rows
+                )
+                + gap_y
+                * max(
+                    0,
+                    len(rows) - 1,
+                )
+            )
+
+        y = max(
+            70,
+            (
+                H
+                - total_height
+            )
+            / 2,
+        )
+
+        for row in rows:
+
+            row_height = max(
+                item["th"]
+                for item in row
+            )
+
+            row_width = (
+                sum(
+                    item["tw"]
+                    for item in row
+                )
+                + space
+                * max(
+                    0,
+                    len(row) - 1,
+                )
+            )
+
+            x = (
+                W
+                - row_width
+            ) / 2
+
+            for item in row:
+
+                placements.append(
+                    {
+                        **item,
+                        "x": int(x),
+                        "y": int(
+                            y
+                            + (
+                                row_height
+                                - item[
+                                    "th"
+                                ]
+                            )
+                            / 2
+                        ),
+                    }
+                )
+
+                x += (
+                    item["tw"]
+                    + space
+                )
+
+            y += (
+                row_height
+                + gap_y
+            )
+
+    # ========================================================
+    # CONGELA POSIÇÕES
+    # ========================================================
+
+    scene["mode"] = mode
+
+    scene["placements"] = (
+        placements
+    )
+
+
+# ============================================================
+# CENA NO TEMPO
+# ============================================================
+
+def scene_at_time(
+    scenes,
+    t,
+    hint=0,
+):
+
+    if not scenes:
+        return -1
+
+    index = min(
+        max(
+            0,
+            hint,
+        ),
+        len(scenes) - 1,
+    )
+
+    while (
+        index + 1
+        < len(scenes)
+        and t >= scenes[index]["end"]
+    ):
+
+        index += 1
+
+    while (
+        index > 0
+        and t < scenes[index]["start"]
+    ):
+
+        index -= 1
+
+    # Fora de qualquer frase
+    if (
+        t < scenes[index]["start"]
+        or t >= scenes[index]["end"]
+    ):
+
+        return -1
+
+    return index
+
+
+# ============================================================
+# FUNDO
+# ============================================================
+
+def background_for(
+    scene_index
+):
+
+    if scene_index % 2 == 0:
+
+        return BLACK
+
+    return WHITE
+
+
+def blend_background(
+    first,
+    second,
+    amount,
+):
+
+    amount = max(
+        0.0,
+        min(
+            1.0,
+            amount,
+        ),
+    )
+
+    amount = smoothstep(
+        amount
+    )
+
+    return tuple(
+        int(
+            first[i]
+            * (
+                1
+                - amount
+            )
+            + second[i]
+            * amount
+        )
+        for i in range(3)
+    )
+
+
+# ============================================================
+# DESENHA TEXTO COM ALPHA
+# ============================================================
+
+def draw_text_with_alpha(
+    image,
+    item,
+    color,
+    alpha,
+):
+
+    if alpha >= 255:
+
+        draw = ImageDraw.Draw(
+            image
+        )
+
+        draw.text(
+            (
+                item["x"],
+                item["y"],
+            ),
+            item["text"],
+            font=item["font"],
+            fill=color,
+        )
+
+        return image
+
+    if alpha <= 0:
+        return image
+
+    padding = 8
+
+    width = (
+        item["tw"]
+        + padding * 2
+    )
+
+    height = (
+        item["th"]
+        + padding * 2
+    )
+
+    layer = Image.new(
+        "RGBA",
+        (
+            width,
+            height,
+        ),
+        (0, 0, 0, 0),
+    )
+
+    layer_draw = (
+        ImageDraw.Draw(
+            layer
+        )
+    )
+
+    layer_draw.text(
+        (
+            padding
+            - item["bbox"][0],
+            padding
+            - item["bbox"][1],
+        ),
+        item["text"],
+        font=item["font"],
+        fill=(
+            color[0],
+            color[1],
+            color[2],
+            alpha,
+        ),
+    )
+
+    image.paste(
+        layer,
+        (
+            item["x"]
+            - padding,
+            item["y"]
+            - padding,
+        ),
+        layer,
+    )
+
+    return image
+
+
+# ============================================================
+# FRAME
+#
+# NOVA REGRA:
+#
+# A palavra entra com fade-in.
+#
+# Depois que entra, ela permanece.
+#
+# Nenhuma palavra é apagada individualmente.
+#
+# Toda a frase desaparece quando chega ao
+# timestamp END da frase.
+# ============================================================
+
+def draw_frame(
+    scene,
+    scene_index,
+    time_position,
+):
+
+    current_background = (
+        background_for(
+            scene_index
+        )
+    )
+
+    background = (
+        current_background
+    )
+
+    # --------------------------------------------------------
+    # TRANSIÇÃO DE FUNDO
+    # --------------------------------------------------------
+
+    if (
+        scene_index > 0
+        and (
+            time_position
+            - scene["start"]
+        )
+        < BACKGROUND_FADE
+    ):
+
+        previous_background = (
+            background_for(
+                scene_index - 1
+            )
+        )
+
+        progress = (
+            time_position
+            - scene["start"]
+        ) / BACKGROUND_FADE
+
+        background = (
+            blend_background(
+                previous_background,
+                current_background,
+                progress,
+            )
+        )
+
+    image = Image.new(
+        "RGB",
+        (W, H),
+        background,
+    )
+
+    brightness = (
+        sum(background)
+        / 3
+    )
+
+    main_color = (
+        BLACK
+        if brightness > 128
+        else WHITE
+    )
+
+    # ========================================================
+    # PALAVRAS
+    # ========================================================
+
+    for item in scene[
+        "placements"
+    ]:
+
+        # A palavra ainda não entrou
+        if (
+            time_position
+            < item["start"]
+        ):
+
+            continue
+
+        # ----------------------------------------------------
+        # FADE-IN
+        # ----------------------------------------------------
+
+        age = (
+            time_position
+            - item["start"]
+        )
+
+        if age >= WORD_FADE:
+
+            alpha = 255
+
+        else:
+
+            alpha = int(
+                255
+                * max(
+                    0.0,
+                    min(
+                        1.0,
+                        age
+                        / WORD_FADE,
+                    ),
+                )
+            )
+
+        # ----------------------------------------------------
+        # COR
+        # ----------------------------------------------------
+
+        if item["blue"]:
+
+            color = ROYAL
+
+        else:
+
+            color = main_color
+
+        # ----------------------------------------------------
+        # DESENHA
+        # ----------------------------------------------------
+
+        image = draw_text_with_alpha(
+            image,
+            item,
+            color,
+            alpha,
+        )
+
+    # ========================================================
+    # IMPORTANTE:
+    #
+    # NÃO existe fade-out individual.
+    #
+    # O draw_frame só é chamado para essa
+    # cena enquanto:
+    #
+    # scene.start <= tempo < scene.end
+    #
+    # Portanto, ao atingir scene.end,
+    # a frase inteira deixa de ser desenhada.
+    # ========================================================
+
+    return (
+        image,
+        True,
+    )
+
+
+# ============================================================
+# VALIDAÇÃO
+# ============================================================
+
+def validate_text_visibility(
+    scenes
+):
+
+    if not scenes:
+        return False
+
+    samples = []
+
+    for scene in scenes:
+
+        if not scene[
+            "placements"
+        ]:
+            continue
+
+        first_word = min(
+            scene["placements"],
+            key=lambda x:
+            x["start"],
+        )
+
+        samples.append(
+            max(
+                scene["start"],
+                first_word["start"]
+                + 0.12,
+            )
+        )
+
+    for time_position in samples[
+        :8
+    ]:
+
+        index = scene_at_time(
+            scenes,
+            time_position,
+        )
+
+        if index < 0:
+            continue
+
+        frame, rendered = (
+            draw_frame(
+                scenes[index],
+                index,
+                time_position,
+            )
+        )
+
+        if not rendered:
+            continue
+
+        background = (
+            background_for(
+                index
+            )
+        )
+
+        pixels = frame.load()
+
+        changed = 0
+
+        for y in range(
+            0,
+            H,
+            8,
+        ):
+
+            for x in range(
+                0,
+                W,
+                8,
+            ):
+
+                if (
+                    pixels[x, y]
+                    != background
+                ):
+
+                    changed += 1
+
+                    if changed > 20:
+
+                        return True
+
+    return False
+
+
+# ============================================================
+# RENDERIZAÇÃO
+# ============================================================
+
+def render_video(
+    audio_path,
+    scenes,
+    output_path,
+    quality,
+    progress,
+    logo,
+    intro_duration,
+):
+
+    duration, has_audio = (
+        media_info(
+            audio_path
+        )
+    )
+
+    if not has_audio:
+
+        raise RuntimeError(
+            "O arquivo enviado "
+            "não possui faixa de áudio."
+        )
+
+    fonts = local_fonts()
+
+    # ========================================================
+    # PREPARA LAYOUT
+    # ========================================================
+
+    for i, scene in enumerate(
+        scenes
+    ):
+
+        prepare_scene(
+            scene,
+            i,
+            fonts,
+        )
+
+    if not validate_text_visibility(
+        scenes
+    ):
+
+        raise RuntimeError(
+            "A validação detectou "
+            "que nenhuma legenda seria "
+            "visível."
+        )
+
+    # ========================================================
+    # FINAL REAL DA MÚSICA
+    # ========================================================
+
+    last_word_end = max(
+        (
+            float(word["end"])
+            for scene in scenes
+            for word in scene[
+                "words"
+            ]
+        ),
+        default=0.0,
+    )
+
+    if last_word_end > 0:
+
+        final_end = min(
+            duration,
+            last_word_end
+            + 0.65,
+        )
+
+    else:
+
+        final_end = duration
+
+    if final_end < 0.5:
+
+        final_end = duration
+
+    ff = get_ffmpeg()
+
+    silent_video = (
+        Path(output_path)
+        .with_name(
+            "video_sem_audio.mp4"
+        )
+    )
+
+    if quality == "Alta qualidade":
+
+        crf = "16"
+        preset = "fast"
+
+    else:
+
+        crf = "18"
+        preset = "veryfast"
+
+    command = [
+        ff,
+        "-y",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "-s",
+        f"{W}x{H}",
+        "-r",
+        str(FPS),
+        "-i",
+        "-",
+        "-an",
+        "-c:v",
+        "libx264",
+        "-preset",
+        preset,
+        "-crf",
+        crf,
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        str(silent_video),
+    ]
+
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    total_duration = final_end
+
+    total_frames = max(
+        1,
+        int(
+            total_duration
+            * FPS
+        ),
+    )
+
+    scene_hint = 0
+
+    rendered_frames = 0
+
+    try:
+
+        for frame_index in range(
+            total_frames
+        ):
+
+            time_position = (
+                frame_index
+                / FPS
+            )
+
+            # =================================================
+            # INTRO
+            # =================================================
+
+            if (
+                time_position
+                < intro_duration
+            ):
+
+                frame = (
+                    draw_intro_frame(
+                        logo,
+                        time_position,
+                        intro_duration,
+                    )
+                )
+
+                rendered = False
+
+            # =================================================
+            # LETRA
+            # =================================================
+
+            else:
+
+                scene_hint = (
+                    scene_at_time(
+                        scenes,
+                        time_position,
+                        scene_hint,
+                    )
+                )
+
+                if scene_hint < 0:
+
+                    frame = Image.new(
+                        "RGB",
+                        (W, H),
+                        BLACK,
+                    )
+
+                    rendered = False
+
+                else:
+
+                    frame, rendered = (
+                        draw_frame(
+                            scenes[
+                                scene_hint
+                            ],
+                            scene_hint,
+                            time_position,
+                        )
+                    )
+
+            if rendered:
+
+                rendered_frames += 1
+
+            process.stdin.write(
+                frame.tobytes()
+            )
+
+            if (
+                progress
+                and frame_index
+                % FPS
+                == 0
+            ):
+
+                percent = int(
+                    frame_index
+                    / total_frames
+                    * 100
+                )
+
+                progress.progress(
+                    min(
+                        0.92,
+                        frame_index
+                        / total_frames
+                        * 0.92,
+                    ),
+                    text=(
+                        f"Renderizando "
+                        f"{percent}%"
+                    ),
+                )
+
+        process.stdin.close()
+
+        error_text = (
+            process.stderr
+            .read()
+            .decode(
+                "utf-8",
+                "replace",
+            )
+        )
+
+        code = process.wait()
+
+        if code != 0:
+
+            raise RuntimeError(
+                error_text[-7000:]
+                or
+                "FFmpeg falhou."
+            )
+
+    finally:
+
+        if process.poll() is None:
+
+            try:
+                process.kill()
+
+            except Exception:
+                pass
+
+    if rendered_frames <= 0:
+
+        silent_video.unlink(
+            missing_ok=True
+        )
+
+        raise RuntimeError(
+            "Nenhum frame com "
+            "legenda foi renderizado."
+        )
+
+    # ========================================================
+    # ÁUDIO ORIGINAL
+    # ========================================================
+
+    run_cmd(
+        [
+            ff,
+            "-y",
+            "-i",
+            str(silent_video),
+            "-i",
+            str(audio_path),
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-t",
+            f"{final_end:.3f}",
+            "-movflags",
+            "+faststart",
+            str(output_path),
+        ],
+        timeout=max(
+            180,
+            int(
+                final_end * 8
+            ),
+        ),
+    )
+
+    silent_video.unlink(
+        missing_ok=True
+    )
+
+    if progress:
+
+        progress.progress(
+            1.0,
+            text="Vídeo concluído.",
+        )
+
+    return (
+        final_end,
+        rendered_frames,
+    )
+
+
+# ============================================================
+# STREAMLIT
+# ============================================================
+
+st.set_page_config(
+    page_title="Lyric AI Studio",
+    page_icon="🎵",
+    layout="centered",
+)
+
+st.title(
+    "🎵 Lyric AI Studio"
+)
+
+st.caption(
+    f"Typography Sync · "
+    f"{APP_VERSION}"
+)
+
+
+# ============================================================
+# EXPLICAÇÃO
+# ============================================================
+
+with st.expander(
+    "Como usar",
+    expanded=False,
+):
+
+    st.markdown(
+        """
+Cole a letra oficial com timestamps.
+
+Exemplo:
+
+`00:11.700 - 00:15.200 | É o que eu quero pra nós`
+
+`00:15.200 - 00:22.900 | E que nada nesse mundo cale a nossa voz`
+
+`00:22.900 - 00:26.000 | Céu e mar`
+
+O comportamento das frases é:
+
+- O timestamp inicial controla exatamente quando a frase começa.
+- As palavras entram progressivamente com fade-in.
+- Cada palavra que entrou permanece na tela.
+- Nenhuma palavra desaparece individualmente.
+- O timestamp final controla exatamente quando a frase inteira desaparece.
+- O Whisper não altera os timestamps fornecidos.
+        """
+    )
+
+
+# ============================================================
+# LOGO
+# ============================================================
+
+logo = load_logo_from_file()
+
+if logo is not None:
+
+    st.caption(
+        "✓ Logo do perfil carregada "
+        "automaticamente."
+    )
+
+else:
+
+    st.warning(
+        "A logo não foi encontrada. "
+        "Coloque `logo_perfil.png` na "
+        "mesma pasta do app.py. "
+        "O vídeo continuará funcionando "
+        "sem a logo."
+    )
+
+
+# ============================================================
+# ARQUIVOS
+# ============================================================
+
+audio = st.file_uploader(
+    "1. Música ou vídeo com a música",
+    type=[
+        "mp3",
+        "wav",
+        "m4a",
+        "mp4",
+        "mov",
+        "webm",
+    ],
+)
+
+
+lyrics = st.text_area(
+    "2. Letra oficial com timestamps",
+    height=230,
+    placeholder=(
+        "00:11.700 - 00:15.200 | "
+        "É o que eu quero pra nós\n"
+        "00:15.200 - 00:22.900 | "
+        "E que nada nesse mundo cale a nossa voz\n"
+        "00:22.900 - 00:26.000 | "
+        "Céu e mar"
+    ),
+)
+
+
+column1, column2 = st.columns(
+    2
+)
+
+
+with column1:
+
+    model_name = st.selectbox(
+        "Reconhecimento",
+        [
+            "small",
+            "medium",
+            "large-v3-turbo",
+            "large-v3",
+        ],
+        index=0,
+    )
+
+
+with column2:
+
+    quality = st.selectbox(
+        "Qualidade",
+        [
+            "Equilibrado",
+            "Alta qualidade",
+        ],
+        index=0,
+    )
+
+
+st.selectbox(
+    "Resolução",
+    [
+        "720 × 1280",
+    ],
+    index=0,
+    disabled=True,
+)
+
+
+# ============================================================
+# FONTES
+# ============================================================
+
+try:
+
+    fonts_available = (
+        local_fonts()
+    )
+
+    st.caption(
+        f"Fontes locais disponíveis: "
+        f"{len(fonts_available)} · "
+        f"variação palavra por palavra · "
+        f"sem download de fontes"
+    )
+
+except Exception as exc:
+
+    st.error(
+        str(exc)
+    )
+
+    st.stop()
+
+
+# ============================================================
+# BOTÃO
+# ============================================================
+
+if st.button(
+    "🚀 CRIAR LYRIC VIDEO",
+    type="primary",
+    use_container_width=True,
+):
+
+    if not audio:
+
+        st.error(
+            "Envie a música primeiro."
+        )
+
+        st.stop()
+
+    if not lyrics.strip():
+
+        st.error(
+            "Cole a letra com timestamps "
+            "para obter a sincronização exata."
+        )
+
+        st.stop()
+
+    temp_dir = Path(
+        tempfile.mkdtemp(
+            prefix="lyric_ai_"
+        )
+    )
+
+    status = st.empty()
+
+    progress = st.progress(
+        0
+    )
+
+    try:
+
+        # ====================================================
+        # ARQUIVO
+        # ====================================================
+
+        input_path = (
+            temp_dir
+            / safe_filename(
+                audio.name
+            )
+        )
+
+        input_path.write_bytes(
+            audio.getbuffer()
+        )
+
+        duration, has_audio = (
+            media_info(
+                input_path
+            )
+        )
+
+        if not has_audio:
+
+            raise RuntimeError(
+                "O arquivo enviado "
+                "não possui áudio."
+            )
+
+        # ====================================================
+        # BPM
+        # ====================================================
+
+        status.write(
+            "Analisando o ritmo da música..."
+        )
+
+        bpm = estimate_bpm(
+            input_path
+        )
+
+        # ====================================================
+        # TRANSCRIÇÃO
+        # ====================================================
+
+        try:
+
+            (
+                segments,
+                asr_words,
+                language,
+            ) = transcribe(
+                input_path,
+                model_name,
+                status,
+            )
+
+            used_model = model_name
+
+        except Exception as first_error:
+
+            if model_name == "small":
+
+                raise RuntimeError(
+                    "Falha na transcrição: "
+                    f"{first_error}"
+                )
+
+            status.warning(
+                "O modelo escolhido "
+                "falhou. Tentando "
+                "small para manter "
+                "o Streamlit leve..."
+            )
+
+            (
+                segments,
+                asr_words,
+                language,
+            ) = transcribe(
+                input_path,
+                "small",
+                status,
+            )
+
+            used_model = "small"
+
+        if (
+            not segments
+            and not asr_words
+        ):
+
+            raise RuntimeError(
+                "O reconhecimento "
+                "não encontrou "
+                "segmentos nem palavras."
+            )
+
+        # ====================================================
+        # FIM DA VOZ
+        # ====================================================
+
+        last_asr_word = max(
+            (
+                word["end"]
+                for word in asr_words
+            ),
+            default=0.0,
+        )
+
+        if last_asr_word > 0:
+
+            sung_end = min(
+                duration,
+                last_asr_word
+                + 0.65,
+            )
+
+        else:
+
+            sung_end = duration
+
+        # ====================================================
+        # LETRA
+        # ====================================================
+
+        timed = parse_timed_lyrics(
+            lyrics
+        )
+
+        if not timed:
+
+            raise RuntimeError(
+                "Não foi possível interpretar "
+                "os timestamps. Use o formato:\n\n"
+                "00:11.700 - 00:15.200 | "
+                "Texto da frase"
+            )
+
+        scenes = build_scenes(
+            timed,
+            segments,
+            asr_words,
+            sung_end,
+        )
+
+        if not scenes:
+
+            raise RuntimeError(
+                "Não foi possível "
+                "criar as legendas."
+            )
+
+        # ====================================================
+        # INTRO
+        # ====================================================
+
+        first_lyric_start = (
+            scenes[0]["start"]
+            if scenes
+            else None
+        )
+
+        intro_duration = (
+            calculate_intro_duration(
+                bpm,
+                first_lyric_start,
+            )
+        )
+
+        # ====================================================
+        # LAYOUT
+        # ====================================================
+
+        for i, scene in enumerate(
+            scenes
+        ):
+
+            prepare_scene(
+                scene,
+                i,
+                fonts_available,
+            )
+
+        total_rendered_words = sum(
+            len(scene["words"])
+            for scene in scenes
+        )
+
+        first_caption = (
+            scenes[0]["text"]
+        )
+
+        last_caption = (
+            scenes[-1]["text"]
+        )
+
+        # ====================================================
+        # DIAGNÓSTICO
+        # ====================================================
+
+        with st.expander(
+            "🤖 Informações e ações da IA",
+            expanded=True,
+        ):
+
+            st.markdown(
+                "### Análise realizada"
+            )
+
+            diag1, diag2 = (
+                st.columns(2)
+            )
+
+            with diag1:
+
+                st.write(
+                    f"**Duração:** "
+                    f"{duration:.2f}s"
+                )
+
+                st.write(
+                    f"**BPM estimado:** "
+                    f"{bpm:.1f}"
+                )
+
+                st.write(
+                    f"**Duração da intro:** "
+                    f"{intro_duration:.2f}s"
+                )
+
+                st.write(
+                    f"**Fim detectado:** "
+                    f"{sung_end:.2f}s"
+                )
+
+                st.write(
+                    f"**Segmentos reconhecidos:** "
+                    f"{len(segments)}"
+                )
+
+                st.write(
+                    f"**Palavras reconhecidas:** "
+                    f"{len(asr_words)}"
+                )
+
+            with diag2:
+
+                st.write(
+                    f"**Frases com timestamp:** "
+                    f"{len(scenes)}"
+                )
+
+                st.write(
+                    f"**Palavras renderizadas:** "
+                    f"{total_rendered_words}"
+                )
+
+                st.write(
+                    f"**Modelo utilizado:** "
+                    f"{used_model}"
+                )
+
+                st.write(
+                    f"**Idioma detectado:** "
+                    f"{language}"
+                )
+
+            st.markdown(
+                "### ⚙️ Regras usadas na criação"
+            )
+
+            st.write(
+                "✓ Timestamps fornecidos pelo usuário "
+                "têm prioridade absoluta."
+            )
+
+            st.write(
+                "✓ O Whisper não desloca o início "
+                "nem o fim das frases."
+            )
+
+            st.write(
+                "✓ Palavras entram progressivamente "
+                "com fade-in."
+            )
+
+            st.write(
+                "✓ Depois de aparecer, cada palavra "
+                "permanece na tela."
+            )
+
+            st.write(
+                "✓ Todas as palavras da frase "
+                "desaparecem juntas no timestamp final."
+            )
+
+            st.write(
+                "✓ Fundo preto/branco alternado."
+            )
+
+            st.write(
+                "✓ Palavras azuis selecionadas "
+                "automaticamente."
+            )
+
+            st.write(
+                "✓ Fontes alternadas palavra por palavra."
+            )
+
+            st.write(
+                "✓ Intro com logo e círculo expansivo."
+            )
+
+            st.markdown(
+                "### 📝 Primeira frase"
+            )
+
+            st.code(
+                first_caption
+            )
+
+            st.markdown(
+                "### 📝 Última frase"
+            )
+
+            st.code(
+                last_caption
+            )
+
+        # ====================================================
+        # RENDER
+        # ====================================================
+
+        output_path = (
+            temp_dir
+            / "lyric_ai_final.mp4"
+        )
+
+        (
+            final_end,
+            rendered_frames,
+        ) = render_video(
+            input_path,
+            scenes,
+            output_path,
+            quality,
+            progress,
+            logo,
+            intro_duration,
+        )
+
+        # ====================================================
+        # VALIDAÇÃO FINAL
+        # ====================================================
+
+        if (
+            not output_path.exists()
+            or output_path.stat().st_size
+            < 10000
+        ):
+
+            raise RuntimeError(
+                "O MP4 final não foi "
+                "criado corretamente."
+            )
+
+        final_duration, final_audio = (
+            media_info(
+                output_path
+            )
+        )
+
+        if not final_audio:
+
+            raise RuntimeError(
+                "O MP4 final foi "
+                "criado sem áudio."
+            )
+
+        if rendered_frames <= 0:
+
+            raise RuntimeError(
+                "Nenhuma legenda "
+                "foi efetivamente "
+                "renderizada."
+            )
+
+        st.success(
+            f"Vídeo pronto · "
+            f"{final_duration:.2f}s · "
+            f"frames com legenda: "
+            f"{rendered_frames} · "
+            f"áudio: OK"
+        )
+
+        video_bytes = (
+            output_path.read_bytes()
+        )
+
+        st.video(
+            video_bytes
+        )
+
+        st.download_button(
+            "⬇️ BAIXAR MP4",
+            data=video_bytes,
+            file_name=(
+                "lyric_ai_video.mp4"
+            ),
+            mime="video/mp4",
+            use_container_width=True,
+        )
+
+    except Exception as exc:
+
+        st.error(
+            "A renderização não "
+            "foi concluída."
+        )
+
+        st.exception(
+            exc
+        )
+
+    finally:
+
+        shutil.rmtree(
+            temp_dir,
+            ignore_errors=True,
+        )
