@@ -7,7 +7,7 @@ import numpy as np
 import streamlit as st
 from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageEnhance
 
-APP_VERSION = "8.0-ROYAL-SYNC"
+APP_VERSION = "8.1-EXACT-TIMESTAMPS"
 FPS = 30
 W, H = 1080, 1920
 
@@ -142,18 +142,48 @@ def transcribe(path,model,status=None):
                               "prob":float(getattr(w,"probability",0) or 0)})
     return words,getattr(info,"language","pt"),float(getattr(info,"duration",0) or 0)
 
+def parse_timecode(value):
+    value=norm(value).replace(",", ".")
+    if re.fullmatch(r"\d+(?:\.\d+)?", value):
+        return float(value)
+    m=re.fullmatch(r"(\d+):(\d{1,2}):(\d{1,2})(?:\.(\d{1,3}))?", value)
+    if m:
+        h,mi,se=int(m.group(1)),int(m.group(2)),int(m.group(3))
+        frac=m.group(4) or "0"
+        return h*3600+mi*60+se+float("0."+frac)
+    m=re.fullmatch(r"(\d{1,2}):(\d{1,2})(?:\.(\d{1,3}))?", value)
+    if m:
+        mi,se=int(m.group(1)),int(m.group(2))
+        frac=m.group(3) or "0"
+        return mi*60+se+float("0."+frac)
+    return None
+
 def parse_timed(text):
     out=[]
     for line in text.splitlines():
         line=line.strip()
         if not line: continue
-        m=re.match(r"^(?:(\d+):)?(\d{1,2}):(\d{2})(?:[.,](\d{1,3}))?\s*\|\s*(.+)$",line)
-        if m:
-            h=int(m.group(1) or 0); mi=int(m.group(2)); se=int(m.group(3)); fr=m.group(4) or "0"
-            out.append({"start":h*3600+mi*60+se+float("0."+fr),"text":norm(m.group(5))})
-            continue
-        m=re.match(r"^(\d+(?:[.,]\d+)?)\s*\|\s*(.+)$",line)
-        if m: out.append({"start":float(m.group(1).replace(",",".")),"text":norm(m.group(2))})
+        if "|" not in line: continue
+        timing, lyric = line.split("|",1)
+        lyric=norm(lyric)
+        if not lyric: continue
+
+        # Accept the exact format used by the app:
+        # 00:11.700 - 00:15.200 | lyric
+        parts=re.split(r"\s*[-ââ]\s*", timing.strip(), maxsplit=1)
+        if len(parts)==2:
+            start=parse_timecode(parts[0])
+            end=parse_timecode(parts[1])
+            if start is not None and end is not None and end>start:
+                out.append({"start":start,"end":end,"text":lyric,"explicit_end":True})
+                continue
+
+        # Also keep backwards compatibility with:
+        # 00:11.700 | lyric
+        start=parse_timecode(timing.strip())
+        if start is not None:
+            out.append({"start":start,"end":None,"text":lyric,"explicit_end":False})
+
     out.sort(key=lambda x:x["start"])
     return out
 
@@ -162,15 +192,20 @@ def plain_lines(text):
 
 def align_phrase(text, start, end, asr):
     toks=re.findall(r"\S+",text)
-    cand=[(i,w) for i,w in enumerate(asr) if w["end"]>=start-.25 and w["start"]<=end+.25]
-    n=len(toks); m=len(cand)
-    if not n:return []
-    # Dynamic programming monotonic alignment. Skips ASR words when Whisper invents
-    # extras and skips lyric tokens when Whisper misses them.
-    dp=np.full((n+1,m+1),-1e9,float); back=np.zeros((n+1,m+1),np.int8)
+    n=len(toks)
+    if not n or end<=start:
+        return []
+
+    # Whisper is used only to learn the relative rhythm of the words.
+    # The supplied timestamps remain the absolute truth for the phrase.
+    cand=[(i,w) for i,w in enumerate(asr)
+          if w["end"]>=start-.20 and w["start"]<=end+.20]
+
+    dp=np.full((n+1,len(cand)+1),-1e9,float)
+    back=np.zeros((n+1,len(cand)+1),np.int8)
     dp[0,:]=0
     for i in range(1,n+1):
-        for j in range(1,m+1):
+        for j in range(1,len(cand)+1):
             sc=sim(toks[i-1],cand[j-1][1]["word"])
             match=dp[i-1,j-1]+(4.0*sc-0.20)
             skip_lyric=dp[i-1,j]-0.65
@@ -178,47 +213,99 @@ def align_phrase(text, start, end, asr):
             best=max(match,skip_lyric,skip_asr)
             dp[i,j]=best
             back[i,j]=1 if best==match else (2 if best==skip_lyric else 3)
-    i,j=n,m; matches={}
+
+    i,j=n,len(cand); matches={}
     while i>0 and j>0:
         b=back[i,j]
         if b==1:
             score=sim(toks[i-1],cand[j-1][1]["word"])
-            if score>=.38: matches[i-1]=cand[j-1][1]
-            i-=1;j-=1
-        elif b==2:i-=1
-        else:j-=1
-    # Interpolate missing lyric words only inside this phrase.
+            if score>=.38:
+                matches[i-1]=cand[j-1][1]
+            i-=1; j-=1
+        elif b==2:
+            i-=1
+        else:
+            j-=1
+
     result=[None]*n
-    for i,w in matches.items(): result[i]={"word":toks[i],"start":w["start"],"end":w["end"],
-                                           "prob":max(w.get("prob",0),sim(toks[i],w["word"])*.75)}
-    known=[i for i,x in enumerate(result) if x]
-    for i in range(n):
-        if result[i]:continue
-        prev=max([k for k in known if k<i],default=-1)
-        nxt=min([k for k in known if k>i],default=n)
+    known=[]
+    if matches:
+        raw_first=min(w["start"] for w in matches.values())
+        raw_last=max(w["end"] for w in matches.values())
+        raw_span=max(.001,raw_last-raw_first)
+        target_span=end-start
+
+        # Affine remap: first matched word starts at the supplied start,
+        # last matched word ends at the supplied end. This removes Whisper
+        # latency while preserving its internal rhythmic spacing.
+        def remap(v):
+            return start + (v-raw_first)/raw_span*target_span
+
+        for k,w in matches.items():
+            ws=clamp(remap(w["start"]),start,end)
+            we=clamp(remap(w["end"]),ws+.035,end)
+            result[k]={"word":toks[k],"start":ws,"end":we,
+                       "prob":max(w.get("prob",0),sim(toks[k],w["word"])*.75)}
+        known=[k for k,x in enumerate(result) if x]
+
+    # Fill missing words between known timestamps.
+    for k in range(n):
+        if result[k]: continue
+        prev=max([q for q in known if q<k],default=-1)
+        nxt=min([q for q in known if q>k],default=n)
         a=result[prev]["end"] if prev>=0 else start
         b=result[nxt]["start"] if nxt<n else end
         count=max(1,nxt-prev)
-        st=a+(b-a)*(i-prev)/count
-        en=a+(b-a)*(i-prev+1)/count
-        result[i]={"word":toks[i],"start":clamp(st,start,end),"end":clamp(max(st+.055,en),start+.055,end),"prob":.45}
+        ws=a+(b-a)*(k-prev)/count
+        we=a+(b-a)*(k-prev+1)/count
+        result[k]={"word":toks[k],"start":clamp(ws,start,end),
+                   "end":clamp(max(ws+.035,we),start,end),"prob":.45}
+
+    # If matching failed completely, distribute time by character weight.
+    if not known:
+        weights=[max(1,len(re.sub(r"[^\w]","",x))) for x in toks]
+        total=sum(weights)
+        cursor=start
+        for k,wgt in enumerate(weights):
+            span=(end-start)*wgt/total
+            ws=cursor
+            we=end if k==n-1 else min(end,cursor+span)
+            result[k]["start"]=ws
+            result[k]["end"]=max(ws+.035,min(end,we))
+            cursor=we
+
     for w in result:
         w["start"]=clamp(w["start"],start,end)
-        w["end"]=clamp(max(w["start"]+.055,w["end"]),w["start"]+.055,end)
+        w["end"]=clamp(max(w["start"]+.035,w["end"]),w["start"]+.035,end)
     return result
 
 def build_timed(lines,asr,aend):
     scenes=[]
     for i,line in enumerate(lines):
-        st=line["start"]
-        if st>=aend:break
-        en=min(lines[i+1]["start"] if i+1<len(lines) else aend,aend)
-        if en<=st+.05:continue
+        st=float(line["start"])
+        if st>=aend: break
+
+        # Explicit end timestamps are authoritative. For legacy start-only
+        # lines, use the next line's start as the end.
+        if line.get("explicit_end") and line.get("end") is not None:
+            en=float(line["end"])
+        else:
+            en=float(lines[i+1]["start"]) if i+1<len(lines) else aend
+
+        en=min(en,aend)
+        if en<=st+.05: continue
+
         words=align_phrase(line["text"],st,en,asr)
-        if not words:continue
-        for w in words:w["phrase_id"]=i;w["phrase_text"]=line["text"]
-        scenes.append({"start":max(0,st-.025),"end":min(aend,en+.18),
-                       "words":words,"phrase_text":line["text"],"instrumental":False})
+        if not words:
+            continue
+        for w in words:
+            w["phrase_id"]=i
+            w["phrase_text"]=line["text"]
+
+        # Do not add any hidden early/late padding: the user's timestamps
+        # are the exact phrase boundaries.
+        scenes.append({"start":max(0,st),"end":en,"words":words,
+                       "phrase_text":line["text"],"instrumental":False})
     return scenes
 
 def build_plain(text,asr,aend):
@@ -305,7 +392,7 @@ def draw_text_layer(text,font,color,alpha=255,scale=1.0,glow=False):
     return layer
 
 def render_words(overlay,scene,font_path,style,local):
-    words=scene["words"]; spoken=[(i,w,w["start"]-scene["start"]) for i,w in enumerate(words) if local>=w["start"]-scene["start"]-.01]
+    words=scene["words"]; spoken=[(i,w,w["start"]-scene["start"]) for i,w in enumerate(words) if local>=w["start"]-scene["start"]]
     if not spoken:return
     d=ImageDraw.Draw(overlay)
     blue=choose_blue(words,style.blue,hash(scene["phrase_text"])%1000)
@@ -318,7 +405,7 @@ def render_words(overlay,scene,font_path,style,local):
         visible=spoken[-9:]
         lh=int(f.size*1.02); total=lh*len(visible); y=H/2-total/2
         for i,w,rel in visible:
-            word=w["word"].upper();age=local-rel;p=ease(age/.22)
+            word=w["word"].upper();age=local-rel;p=ease(age/.12)
             col=ROYAL if i in blue else style.fg
             layer=draw_text_layer(word,f,col,int(255*p),.94+.06*p,glow=(i in blue))
             x=int((W-layer.width)/2); yy=int(y+(1-p)*22)
@@ -341,7 +428,7 @@ def render_words(overlay,scene,font_path,style,local):
         x=(W-rw)/2
         for i,w,rel in row:
             word=w["word"].upper();ww=d.textbbox((0,0),word,font=f)[2]
-            age=local-rel;p=ease(age/.22);col=ROYAL if i in blue else style.fg
+            age=local-rel;p=ease(age/.12);col=ROYAL if i in blue else style.fg
             # subtle, fluid entrance: fade + 10px rise + tiny scale.
             layer=draw_text_layer(word,f,col,int(255*p),.965+.035*p,glow=(i in blue))
             overlay.alpha_composite(layer,(int(x-(layer.width-ww)/2),int(y+(1-p)*10-42)))
@@ -359,7 +446,7 @@ def render_frame(scene,style,reg,local,t):
     render_words(overlay,scene,font_path,style,local)
     dur=max(.1,scene["end"]-scene["start"])
     # phrase-level fade; no hard pop between phrases
-    fade=.20
+    fade=.05
     if local<fade:
         aa=int(255*smooth(local/fade))
         overlay.putalpha(overlay.getchannel("A").point(lambda x:int(x*aa/255)))
@@ -414,16 +501,17 @@ st.set_page_config(page_title="Lyric AI Studio",page_icon="ðµ",layout="cen
 st.title("ðµ Lyric AI Studio")
 st.caption(f"Royal Kinetic Word-Sync Â· {APP_VERSION}")
 with st.expander("Como obter a melhor sincronizaÃ§Ã£o",expanded=False):
-    st.markdown("""Cole a letra oficial. Para mÃ¡xima precisÃ£o, use:
-`00:12.30 | primeira frase`
-`00:16.80 | segunda frase`
-`00:21.45 | terceira frase`
+    st.markdown("""Cole a letra oficial com os tempos EXATOS. Use preferencialmente:
+`00:12.300 - 00:16.800 | primeira frase`
+`00:16.800 - 00:21.450 | segunda frase`
+`00:21.450 - 00:25.000 | terceira frase`
 
-O tempo Ã© o inÃ­cio da frase. O Whisper procura as palavras dentro dessa janela.
-Se a letra continuar depois do fim real da mÃºsica, ela serÃ¡ ignorada.""")
+Os horÃ¡rios informados controlam exatamente o inÃ­cio e o fim de cada frase.
+O Whisper Ã© usado apenas para copiar o ritmo relativo entre as palavras, sem deslocar a frase para frente ou para trÃ¡s.
+O fade de cada palavra comeÃ§a exatamente no timestamp calculado dentro dessa janela.""")
 audio=st.file_uploader("1. MÃºsica ou vÃ­deo com a mÃºsica",type=["mp3","wav","m4a","mp4","mov","webm"])
 lyrics=st.text_area("2. Letra oficial (recomendada)",height=230,
-                    placeholder="00:12.30 | Eu sei que vou te amar\n00:16.80 | Por toda a minha vida\n00:21.45 | Eu vou te amar")
+                    placeholder="00:12.300 - 00:16.800 | Eu sei que vou te amar\n00:16.800 - 00:21.450 | Por toda a minha vida\n00:21.450 - 00:25.000 | Eu vou te amar")
 col1,col2=st.columns(2)
 with col1:model=st.selectbox("Reconhecimento",["small","medium","large-v3-turbo","large-v3"],index=2)
 with col2:quality=st.selectbox("Qualidade",["Alta qualidade","Equilibrado"],index=0)
