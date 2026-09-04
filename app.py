@@ -32,6 +32,9 @@ SYSTEM_FONTS = [
     "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
 ]
 BLACK=(5,5,7); BLACK2=(12,12,15); WHITE=(248,248,246); ROYAL=(45,92,255)
+MAIN_FONT_NAME="Anton"          # single consistent font for all regular words
+SAFE_TOP=0.16                    # keep clear of TikTok's top UI (search/tabs)
+SAFE_BOTTOM=0.24                 # keep clear of caption/username/sound/side icons
 
 def clamp(x,a,b): return max(a,min(b,x))
 def ease(t): t=clamp(t,0,1); return 1-(1-t)**3
@@ -112,6 +115,36 @@ def fit_font(text,maxw,size,path,minsize=34):
         if b[2]-b[0]<=maxw:return f
         size-=2
     return ImageFont.truetype(path,minsize)
+
+def _wrap_rows(words,f,maxw,probe):
+    space=probe.textbbox((0,0)," ",font=f)[2]
+    rows=[];row=[];rw=0
+    for i,w in enumerate(words):
+        ww=probe.textbbox((0,0),w["word"].upper(),font=f)[2]
+        if row and rw+space+ww>maxw:
+            rows.append((row,rw));row=[(i,w,ww)];rw=ww
+        else:
+            rw+=ww+(space if row else 0);row.append((i,w,ww))
+    if row:rows.append((row,rw))
+    return rows,space
+
+def fit_wrapped(words,font_path,maxw,avail_h,base_size,minsize):
+    # Wraps the WHOLE phrase (not just already-spoken words) into rows that fit
+    # inside the safe area, shrinking the font until it fits. Layout is computed
+    # once per scene so words don't reflow as more of them appear.
+    probe=ImageDraw.Draw(Image.new("RGB",(1,1)))
+    size=base_size
+    while size>=minsize:
+        f=ImageFont.truetype(font_path,size)
+        rows,space=_wrap_rows(words,f,maxw,probe)
+        lh=int(f.size*1.14)
+        if lh*len(rows)<=avail_h:
+            return rows,f,space,lh
+        size-=2
+    f=ImageFont.truetype(font_path,minsize)
+    rows,space=_wrap_rows(words,f,maxw,probe)
+    lh=int(f.size*1.14)
+    return rows,f,space,lh
 
 @st.cache_resource(show_spinner=False)
 def whisper(model):
@@ -278,32 +311,25 @@ EMOTIONAL={"amor","saudade","coração","coracao","beijo","vida","nunca","sempre
 
 @dataclass
 class Style:
-    bg:Tuple[int,int,int]; fg:Tuple[int,int,int]; font:str; layout:str; blue:bool
+    bg:Tuple[int,int,int]; fg:Tuple[int,int,int]; font:str; accent:str; blue:bool
 
 def style_for(scene,idx,reg):
     s=sum(ord(c) for c in scene.get("phrase_text",""))+idx*37
-    bg=[BLACK,BLACK,BLACK2,(20,20,22),(245,245,243)][s%5]
-    fg=WHITE if sum(bg)<300 else BLACK
+    # Strict monochrome: alternate solid black / solid white, one color per phrase.
+    bg=BLACK if idx%2==0 else WHITE
+    fg=WHITE if bg is BLACK else BLACK
     available=[x for x in ["Anton","Bebas Neue","Archivo Black","Montserrat","Oswald","DM Serif Display","Playfair Display","Libre Baskerville"] if x in reg]
-    font=available[s%len(available)] if available else next(iter(reg))
-    # Stack more often for long phrases; otherwise varied but controlled.
-    n=len(scene.get("words",[]))
-    if n>=9: layout="stack" if s%2==0 else "center"
-    elif n>=6: layout=["center","stack","editorial"][s%3]
-    else: layout=["hero","center","editorial"][s%3]
-    return Style(bg,fg,font,layout,(s%4==0))
+    main=MAIN_FONT_NAME if MAIN_FONT_NAME in reg else (available[0] if available else next(iter(reg)))
+    accent_pool=[x for x in available if x!=main] or available or [main]
+    accent=accent_pool[s%len(accent_pool)]
+    return Style(bg,fg,main,accent,(s%4==0))
 
 def background(style,t):
+    # Pure monochrome background: only the solid alternating black/white fill,
+    # plus an imperceptible grain to avoid flat color banding. No shapes, no glow.
     arr=np.zeros((H,W,3),np.float32);arr[:]=style.bg
-    yy,xx=np.mgrid[0:H,0:W]
-    # monochromatic moving light only; no colored background.
-    cx=W*(.5+.10*math.sin(t*.23)); cy=H*(.48+.08*math.cos(t*.31))
-    d=((xx-cx)/(W*.65))**2+((yy-cy)/(H*.65))**2
-    glow=np.exp(-2.2*d)[...,None]
-    if sum(style.bg)<300: arr+=glow*7
-    else: arr-=glow*7
     rng=np.random.default_rng(int(t*997)%1000003)
-    arr+=rng.normal(0,1.3,(H,W,1))
+    arr+=rng.normal(0,1.0,(H,W,1))
     return Image.fromarray(np.uint8(np.clip(arr,0,255)))
 
 def choose_blue(words,enabled,seed):
@@ -326,59 +352,51 @@ def draw_text_layer(text,font,color,alpha=255,scale=1.0,glow=False):
         layer=layer.resize((int(layer.width*scale),int(layer.height*scale)),Image.Resampling.LANCZOS)
     return layer
 
-def render_words(overlay,scene,font_path,style,local):
-    words=scene["words"]; spoken=[(i,w,w["start"]-scene["start"]) for i,w in enumerate(words) if local>=w["start"]-scene["start"]-.01]
-    if not spoken:return
-    d=ImageDraw.Draw(overlay)
+def render_words(overlay,scene,reg,style,local):
+    words=scene["words"]
+    if not words:return
     blue=choose_blue(words,style.blue,hash(scene["phrase_text"])%1000)
-    n=len(spoken)
-    maxw=int(W*.88)
-    # Large typography. Long phrases use stacked words deliberately.
-    if style.layout=="stack":
-        size=int(H*.078 if n<10 else H*.069)
-        f=fit_font("WWWWWWWW",int(W*.72),size,font_path,34)
-        visible=spoken[-9:]
-        lh=int(f.size*1.02); total=lh*len(visible); y=H/2-total/2
-        for i,w,rel in visible:
-            word=w["word"].upper();age=local-rel;p=ease(age/.22)
-            col=ROYAL if i in blue else style.fg
-            layer=draw_text_layer(word,f,col,int(255*p),.94+.06*p,glow=(i in blue))
-            x=int((W-layer.width)/2); yy=int(y+(1-p)*22)
-            overlay.alpha_composite(layer,(x,yy)); y+=lh
-        return
-    # center/editorial/hero: wrap by actual pixels.
-    size=int(H*.090 if n<=3 else H*.080 if n<=6 else H*.068)
-    # Fit each token, not the entire phrase, preserving large words.
-    f=fit_font("W"*max(5,max(len(w["word"]) for _,w,_ in spoken)),int(W*.82),size,font_path,32)
-    rows=[];row=[];rw=0;space=d.textbbox((0,0)," ",font=f)[2]
-    for item in spoken:
-        ww=d.textbbox((0,0),item[1]["word"].upper(),font=f)[2]
-        if row and rw+space+ww>maxw:
-            rows.append((row,rw));row=[item];rw=ww
-        else:
-            rw += ww+(space if row else 0);row.append(item)
-    if row:rows.append((row,rw))
-    lh=int(f.size*1.08); y=H/2-(len(rows)*lh)/2
-    for ri,(row,rw) in enumerate(rows):
+    main_path=reg.get(style.font) or next(iter(reg.values()))
+    accent_path=reg.get(style.accent) or main_path
+
+    n=len(words)
+    # Smaller, more compact typography; more words -> smaller base size, but the
+    # fitter below will keep shrinking further until everything fits the safe area.
+    base_size=int(H*.058) if n<=3 else int(H*.050) if n<=6 else int(H*.043) if n<=10 else int(H*.037)
+    minsize=max(20,int(H*.022))
+    maxw=int(W*.78)
+    safe_top=int(H*SAFE_TOP); safe_bottom=int(H*SAFE_BOTTOM)
+    avail_h=max(minsize*2,H-safe_top-safe_bottom)
+
+    # Layout computed once from the FULL phrase so word positions stay fixed;
+    # each word simply fades/slides into its own fixed slot as it's sung.
+    rows,f_main,space,lh=fit_wrapped(words,main_path,maxw,avail_h,base_size,minsize)
+    f_accent=ImageFont.truetype(accent_path,f_main.size)
+
+    total_h=lh*len(rows)
+    y=safe_top+(avail_h-total_h)/2
+    for row,rw in rows:
         x=(W-rw)/2
-        for i,w,rel in row:
-            word=w["word"].upper();ww=d.textbbox((0,0),word,font=f)[2]
-            age=local-rel;p=ease(age/.22);col=ROYAL if i in blue else style.fg
-            # subtle, fluid entrance: fade + 10px rise + tiny scale.
-            layer=draw_text_layer(word,f,col,int(255*p),.965+.035*p,glow=(i in blue))
-            overlay.alpha_composite(layer,(int(x-(layer.width-ww)/2),int(y+(1-p)*10-42)))
+        for i,w,ww in row:
+            rel=w["start"]-scene["start"]
+            if local<rel-.01:
+                x+=ww+space;continue
+            age=local-rel
+            # CapCut-style entrance: smoothstep fade + gentle upward slide + soft scale-pop.
+            p=smooth(age/.28)
+            is_accent=i in blue
+            font=f_accent if is_accent else f_main
+            col=ROYAL if is_accent else style.fg
+            layer=draw_text_layer(w["word"].upper(),font,col,int(255*p),.88+.12*p,glow=is_accent)
+            rise=(1-p)*16
+            overlay.alpha_composite(layer,(int(x-(layer.width-ww)/2),int(y+rise-42)))
             x+=ww+space
         y+=lh
 
 def render_frame(scene,style,reg,local,t):
     base=background(style,t).convert("RGBA")
-    overlay=Image.new("RGBA",(W,H),(0,0,0,0));d=ImageDraw.Draw(overlay)
-    # monochrome decorative motion
-    a=int(18+12*(.5+.5*math.sin(t*1.7)))
-    d.ellipse((W*.12,H*.18,W*.88,H*.82),outline=style.fg+(a,),width=3)
-    d.line((W*.10,H*.84,W*(.35+.08*math.sin(t*.8)),H*.84),fill=style.fg+(35,),width=4)
-    font_path=reg[style.font]
-    render_words(overlay,scene,font_path,style,local)
+    overlay=Image.new("RGBA",(W,H),(0,0,0,0))
+    render_words(overlay,scene,reg,style,local)
     dur=max(.1,scene["end"]-scene["start"])
     # phrase-level fade; no hard pop between phrases
     fade=.20
