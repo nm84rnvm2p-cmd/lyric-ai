@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import os, re, math, shutil, subprocess, tempfile, urllib.request, difflib, unicodedata
 from pathlib import Path
 from dataclasses import dataclass
@@ -57,16 +58,16 @@ def ffmpeg():
     except Exception: pass
     p=shutil.which("ffmpeg")
     if p:return p
-    raise RuntimeError("FFmpeg nÃ£o encontrado.")
+    raise RuntimeError("FFmpeg não encontrado.")
 
 def run(cmd, timeout=300):
-    p=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,timeout=timeout)
+    p=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,encoding="utf-8",errors="replace",timeout=timeout)
     if p.returncode: raise RuntimeError(p.stderr[-7000:])
     return p.stdout
 
 def duration(path):
     ff=ffmpeg()
-    p=subprocess.run([ff,"-hide_banner","-i",path,"-f","null","-"],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,timeout=60)
+    p=subprocess.run([ff,"-hide_banner","-i",path,"-f","null","-"],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,encoding="utf-8",errors="replace",timeout=60)
     m=re.search(r"Duration:\s*(\d+):(\d+):([\d.]+)",p.stderr)
     return int(m.group(1))*3600+int(m.group(2))*60+float(m.group(3)) if m else 0.0
 
@@ -77,7 +78,7 @@ def audio_end(path,dur,latest_word=0):
     ff=ffmpeg()
     try:
         p=subprocess.run([ff,"-hide_banner","-i",path,"-af","silencedetect=noise=-40dB:d=0.55","-f","null","-"],
-                         stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,timeout=max(60,int(dur*2)))
+                         stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,encoding="utf-8",errors="replace",timeout=max(60,int(dur*2)))
         starts=[float(x) for x in re.findall(r"silence_start:\s*([\d.]+)",p.stderr)]
         ends=[float(x) for x in re.findall(r"silence_end:\s*([\d.]+)",p.stderr)]
         if starts and starts[-1]>dur*.72:
@@ -120,7 +121,7 @@ def whisper(model):
 
 def transcribe(path,model,status=None):
     m=whisper(model)
-    if status: status.write(f"ðï¸ Transcrevendo palavra por palavra com **{model}**â¦")
+    if status: status.write(f"🎙️ Transcrevendo palavra por palavra com **{model}**…")
     segs,info=m.transcribe(
         path,language="pt",task="transcribe",
         beam_size=8,best_of=8,patience=1.2,
@@ -128,9 +129,9 @@ def transcribe(path,model,status=None):
         log_prob_threshold=-1.2,no_speech_threshold=0.20,
         condition_on_previous_text=True,vad_filter=False,
         word_timestamps=True,
-        initial_prompt=("Letra de mÃºsica brasileira cantada em portuguÃªs. "
-                        "ReconheÃ§a palavras curtas e rÃ¡pidas, repetiÃ§Ãµes e contraÃ§Ãµes. "
-                        "NÃ£o resuma nem traduza.")
+        initial_prompt=("Letra de música brasileira cantada em português. "
+                        "Reconheça palavras curtas e rápidas, repetições e contrações. "
+                        "Não resuma nem traduza.")
     )
     words=[]
     for seg in segs:
@@ -251,8 +252,8 @@ def build_plain(text,asr,aend):
             cursor=idx+1
     return scenes
 
-EMOTIONAL={"amor","saudade","coraÃ§Ã£o","coracao","beijo","vida","nunca","sempre","volta","voltar",
-           "paixÃ£o","paixao","desejo","perfume","chora","chorar","quero","meu","minha","tudo","nada","vocÃª","voce"}
+EMOTIONAL={"amor","saudade","coração","coracao","beijo","vida","nunca","sempre","volta","voltar",
+           "paixão","paixao","desejo","perfume","chora","chorar","quero","meu","minha","tudo","nada","você","voce"}
 
 @dataclass
 class Style:
@@ -407,31 +408,31 @@ def render_video(audio_path,scenes,reg,out_path,res,quality,progress):
          "-c:v","copy","-c:a","aac","-b:a","256k","-t",f"{end:.3f}","-movflags","+faststart",str(out_path)],
         timeout=max(180,int(end*10)))
     silent.unlink(missing_ok=True)
-    if progress:progress.progress(1.0,text="â VÃ­deo concluÃ­do.")
+    if progress:progress.progress(1.0,text="✅ Vídeo concluído.")
     return end
 
-st.set_page_config(page_title="Lyric AI Studio",page_icon="ðµ",layout="centered")
-st.title("ðµ Lyric AI Studio")
-st.caption(f"Royal Kinetic Word-Sync Â· {APP_VERSION}")
-with st.expander("Como obter a melhor sincronizaÃ§Ã£o",expanded=False):
-    st.markdown("""Cole a letra oficial. Para mÃ¡xima precisÃ£o, use:
+st.set_page_config(page_title="Lyric AI Studio",page_icon="🎵",layout="centered")
+st.title("🎵 Lyric AI Studio")
+st.caption(f"Royal Kinetic Word-Sync · {APP_VERSION}")
+with st.expander("Como obter a melhor sincronização",expanded=False):
+    st.markdown("""Cole a letra oficial. Para máxima precisão, use:
 `00:12.30 | primeira frase`
 `00:16.80 | segunda frase`
 `00:21.45 | terceira frase`
 
-O tempo Ã© o inÃ­cio da frase. O Whisper procura as palavras dentro dessa janela.
-Se a letra continuar depois do fim real da mÃºsica, ela serÃ¡ ignorada.""")
-audio=st.file_uploader("1. MÃºsica ou vÃ­deo com a mÃºsica",type=["mp3","wav","m4a","mp4","mov","webm"])
+O tempo é o início da frase. O Whisper procura as palavras dentro dessa janela.
+Se a letra continuar depois do fim real da música, ela será ignorada.""")
+audio=st.file_uploader("1. Música ou vídeo com a música",type=["mp3","wav","m4a","mp4","mov","webm"])
 lyrics=st.text_area("2. Letra oficial (recomendada)",height=230,
                     placeholder="00:12.30 | Eu sei que vou te amar\n00:16.80 | Por toda a minha vida\n00:21.45 | Eu vou te amar")
 col1,col2=st.columns(2)
 with col1:model=st.selectbox("Reconhecimento",["small","medium","large-v3-turbo","large-v3"],index=2)
 with col2:quality=st.selectbox("Qualidade",["Alta qualidade","Equilibrado"],index=0)
-resolution=st.selectbox("ResoluÃ§Ã£o",["1080Ã1920","720Ã1280"],index=0)
+resolution=st.selectbox("Resolução",["1080×1920","720×1280"],index=0)
 reg=fonts()
-st.caption(f"Fontes disponÃ­veis: {len(reg)}")
-if st.button("ð CRIAR LYRIC VIDEO",type="primary",use_container_width=True):
-    if not audio:st.error("Envie a mÃºsica primeiro.");st.stop()
+st.caption(f"Fontes disponíveis: {len(reg)}")
+if st.button("🚀 CRIAR LYRIC VIDEO",type="primary",use_container_width=True):
+    if not audio:st.error("Envie a música primeiro.");st.stop()
     tmp=Path(tempfile.mkdtemp(prefix="lyric_ai_"));status=st.empty();bar=st.progress(0)
     try:
         ap=tmp/safe(audio.name);ap.write_bytes(audio.getbuffer())
@@ -439,16 +440,16 @@ if st.button("ð CRIAR LYRIC VIDEO",type="primary",use_container_width=Tru
         try: asr,lang,dd=transcribe(str(ap),model,status)
         except Exception:
             if model=="small":raise
-            status.warning("Tentando o modelo small por seguranÃ§aâ¦")
+            status.warning("Tentando o modelo small por segurança…")
             asr,lang,dd=transcribe(str(ap),"small",status)
-        if not asr:raise RuntimeError("O reconhecimento nÃ£o encontrou palavras. Tente large-v3 ou forneÃ§a a letra com tempos.")
+        if not asr:raise RuntimeError("O reconhecimento não encontrou palavras. Tente large-v3 ou forneça a letra com tempos.")
         timed=parse_timed(lyrics) if lyrics.strip() else []
         aend=audio_end(str(ap),dur,max((w["end"] for w in asr),default=0))
         if timed:
-            status.write("ð§© Alinhando a letra oficial Ã s palavras reais do cantorâ¦")
+            status.write("🧩 Alinhando a letra oficial às palavras reais do cantor…")
             scenes=build_timed(timed,asr,aend)
         elif lyrics.strip():
-            status.write("ð§© Alinhando a letra oficial ao Ã¡udioâ¦")
+            status.write("🧩 Alinhando a letra oficial ao áudio…")
             scenes=build_plain(lyrics,asr,aend)
         else:
             scenes=[]
@@ -462,20 +463,20 @@ if st.button("ð CRIAR LYRIC VIDEO",type="primary",use_container_width=Tru
             scenes=[{"start":x[0]["start"],"end":min(aend,x[-1]["end"]+.18),"words":x,
                      "phrase_text":" ".join(w["word"] for w in x),"instrumental":False} for x in scenes]
         scenes=[s for s in scenes if s["start"]<aend and s["words"]]
-        if not scenes:raise RuntimeError("NÃ£o foi possÃ­vel alinhar as frases ao Ã¡udio. Use a letra com timestamps.")
-        bar.progress(.15,text="Preparando renderâ¦")
+        if not scenes:raise RuntimeError("Não foi possível alinhar as frases ao áudio. Use a letra com timestamps.")
+        bar.progress(.15,text="Preparando render…")
         res=(1080,1920) if resolution.startswith("1080") else (720,1280)
         out=tmp/"lyric_ai_final.mp4"
         final_end=render_video(str(ap),scenes,reg,str(out),res,quality,bar)
-        status.success(f"VÃ­deo criado atÃ© {final_end:.2f}s â apenas atÃ© o trecho realmente cantado.")
+        status.success(f"Vídeo criado até {final_end:.2f}s — apenas até o trecho realmente cantado.")
         st.video(str(out))
-        st.download_button("â¬ï¸ Baixar MP4",out.read_bytes(),"lyric_ai_final.mp4","video/mp4",use_container_width=True)
-        with st.expander("DiagnÃ³stico"):
+        st.download_button("⬇️ Baixar MP4",out.read_bytes(),"lyric_ai_final.mp4","video/mp4",use_container_width=True)
+        with st.expander("Diagnóstico"):
             st.write(f"Palavras ASR: **{len(asr)}**")
             st.write(f"Frases renderizadas: **{len(scenes)}**")
             st.write(f"Fim detectado: **{final_end:.2f}s**")
             st.write(f"Idioma: **{lang}**")
     except Exception as e:
-        st.error("A geraÃ§Ã£o falhou.")
+        st.error("A geração falhou.")
         st.code(str(e))
     # keep tmp alive for this Streamlit run
