@@ -1,1095 +1,481 @@
-# -*- coding: utf-8 -*-
-
-import os
-import re
-import shutil
-import subprocess
-import tempfile
-import unicodedata
-import math
+import os, re, math, shutil, subprocess, tempfile, urllib.request, difflib, unicodedata
 from pathlib import Path
+from dataclasses import dataclass
+from typing import List, Tuple, Optional
 
+import numpy as np
 import streamlit as st
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageEnhance
 
+APP_VERSION = "8.0-ROYAL-SYNC"
+FPS = 30
+W, H = 1080, 1920
 
-# ============================================================
-# CONFIGURAÇÃO
-# ============================================================
+CACHE = Path(".lyric_cache")
+FONT_DIR = CACHE / "fonts"
+FONT_DIR.mkdir(parents=True, exist_ok=True)
 
-APP_VERSION = "19.0-AI-WORD-SYNC"
-
-W = 720
-H = 1280
-FPS = 20
-
-# Entrada MUITO rápida das palavras.
-WORD_FADE = 0.055
-
-# Duração do pequeno "pop" de entrada.
-WORD_POP_DURATION = 0.10
-
-# Tamanho máximo do pequeno pop.
-WORD_POP_SCALE = 1.08
-
-# Pequeno deslocamento vertical durante o pop.
-WORD_RISE = 10
-
-# Fade conjunto da frase ao terminar.
-PHRASE_FADE = 0.10
-
-# Transição entre fundos.
-BACKGROUND_FADE = 0.20
-
-# Cor azul.
-ROYAL = (45, 92, 255)
-
-BLACK = (0, 0, 0)
-WHITE = (255, 255, 255)
-
-
-# ============================================================
-# FONTES
-# ============================================================
-
-FONT_CANDIDATES = [
-
-    (
-        "Grossa",
-        "/usr/share/fonts/truetype/dejavu/"
-        "DejaVuSansCondensed-Bold.ttf",
-    ),
-
-    (
-        "Sans",
-        "/usr/share/fonts/truetype/dejavu/"
-        "DejaVuSans-Bold.ttf",
-    ),
-
-    (
-        "Serif",
-        "/usr/share/fonts/truetype/dejavu/"
-        "DejaVuSerif-Bold.ttf",
-    ),
-
-    (
-        "Liberation",
-        "/usr/share/fonts/truetype/liberation2/"
-        "LiberationSans-Bold.ttf",
-    ),
-
-    (
-        "FreeSans",
-        "/usr/share/fonts/truetype/freefont/"
-        "FreeSansBold.ttf",
-    ),
-
-    (
-        "Arimo",
-        "/usr/share/fonts/truetype/croscore/"
-        "Arimo-Bold.ttf",
-    ),
-
-    (
-        "Carlito",
-        "/usr/share/fonts/truetype/crosextra/"
-        "Carlito-Bold.ttf",
-    ),
-
-    (
-        "Tinos",
-        "/usr/share/fonts/truetype/croscore/"
-        "Tinos-Bold.ttf",
-    ),
-
+FONT_SOURCES = {
+    "Anton": "https://raw.githubusercontent.com/google/fonts/main/ofl/anton/Anton-Regular.ttf",
+    "Bebas Neue": "https://raw.githubusercontent.com/google/fonts/main/ofl/bebasneue/BebasNeue-Regular.ttf",
+    "Montserrat": "https://raw.githubusercontent.com/google/fonts/main/ofl/montserrat/Montserrat%5Bwght%5D.ttf",
+    "Oswald": "https://raw.githubusercontent.com/google/fonts/main/ofl/oswald/Oswald%5Bwght%5D.ttf",
+    "Archivo Black": "https://raw.githubusercontent.com/google/fonts/main/ofl/archivoblack/ArchivoBlack-Regular.ttf",
+    "DM Serif Display": "https://raw.githubusercontent.com/google/fonts/main/ofl/dmserifdisplay/DMSerifDisplay-Regular.ttf",
+    "Playfair Display": "https://raw.githubusercontent.com/google/fonts/main/ofl/playfairdisplay/PlayfairDisplay%5Bwght%5D.ttf",
+    "Libre Baskerville": "https://raw.githubusercontent.com/google/fonts/main/ofl/librebaskerville/LibreBaskerville-Regular.ttf",
+}
+SYSTEM_FONTS = [
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
 ]
+BLACK=(5,5,7); BLACK2=(12,12,15); WHITE=(248,248,246); ROYAL=(45,92,255)
 
+def clamp(x,a,b): return max(a,min(b,x))
+def ease(t): t=clamp(t,0,1); return 1-(1-t)**3
+def smooth(t): t=clamp(t,0,1); return t*t*(3-2*t)
+def safe(s): return re.sub(r"[^A-Za-z0-9_.-]+","_",s)[:100]
+def norm(s):
+    return re.sub(r"\s+"," ",s or "").strip()
+def token(s):
+    s=unicodedata.normalize("NFKD",s or "")
+    s="".join(c for c in s if not unicodedata.combining(c))
+    return re.sub(r"[^a-zA-Z0-9]","",s).lower()
+def sim(a,b):
+    a,b=token(a),token(b)
+    if not a or not b:return 0
+    if a==b:return 1
+    if a in b or b in a:return .90
+    return difflib.SequenceMatcher(None,a,b,autojunk=False).ratio()
 
-# ============================================================
-# TEXTO / UTF-8
-# ============================================================
-
-def clean_text(value):
-
-    if value is None:
-        return ""
-
-    text = unicodedata.normalize(
-        "NFC",
-        str(value),
-    )
-
-    text = (
-        text
-        .replace("\ufeff", "")
-        .replace("\ufffd", "")
-    )
-
-    text = "".join(
-        ch
-        for ch in text
-        if ch in "\n\t"
-        or unicodedata.category(ch)
-        not in {"Cc", "Cf"}
-    )
-
-    text = re.sub(
-        r"\s+",
-        " ",
-        text,
-    )
-
-    return text.strip()
-
-
-def normalize_for_match(text):
-
-    text = clean_text(
-        text
-    ).lower()
-
-    text = unicodedata.normalize(
-        "NFKD",
-        text,
-    )
-
-    text = "".join(
-        c
-        for c in text
-        if not unicodedata.combining(c)
-    )
-
-    return text
-
-
-def safe_filename(name):
-
-    return (
-        re.sub(
-            r"[^A-Za-z0-9_.-]+",
-            "_",
-            name or "audio",
-        )[:100]
-        or "audio"
-    )
-
-
-# ============================================================
-# FFMPEG
-# ============================================================
-
-def get_ffmpeg():
-
+def ffmpeg():
     try:
-
         import imageio_ffmpeg
+        p=imageio_ffmpeg.get_ffmpeg_exe()
+        if p:return p
+    except Exception: pass
+    p=shutil.which("ffmpeg")
+    if p:return p
+    raise RuntimeError("FFmpeg nÃ£o encontrado.")
 
-        path = (
-            imageio_ffmpeg
-            .get_ffmpeg_exe()
-        )
+def run(cmd, timeout=300):
+    p=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,timeout=timeout)
+    if p.returncode: raise RuntimeError(p.stderr[-7000:])
+    return p.stdout
 
-        if (
-            path
-            and os.path.isfile(path)
-        ):
-            return path
+def duration(path):
+    ff=ffmpeg()
+    p=subprocess.run([ff,"-hide_banner","-i",path,"-f","null","-"],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,timeout=60)
+    m=re.search(r"Duration:\s*(\d+):(\d+):([\d.]+)",p.stderr)
+    return int(m.group(1))*3600+int(m.group(2))*60+float(m.group(3)) if m else 0.0
 
-    except Exception:
-        pass
-
-    path = shutil.which(
-        "ffmpeg"
-    )
-
-    if path:
-        return path
-
-    raise RuntimeError(
-        "FFmpeg não foi encontrado."
-    )
-
-
-def run_cmd(
-    cmd,
-    timeout=300,
-):
-
-    result = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        timeout=timeout,
-    )
-
-    if result.returncode != 0:
-
-        raise RuntimeError(
-            result.stderr[-7000:]
-            or
-            "O comando terminou com erro."
-        )
-
-    return (
-        result.stdout,
-        result.stderr,
-    )
-
-
-def media_info(path):
-
-    _, stderr = run_cmd(
-        [
-            get_ffmpeg(),
-            "-hide_banner",
-            "-i",
-            str(path),
-            "-f",
-            "null",
-            "-",
-        ],
-        timeout=90,
-    )
-
-    match = re.search(
-        r"Duration:\s*(\d+):(\d+):([\d.]+)",
-        stderr,
-    )
-
-    if not match:
-
-        raise RuntimeError(
-            "Não foi possível determinar "
-            "a duração do arquivo."
-        )
-
-    duration = (
-        int(match.group(1)) * 3600
-        + int(match.group(2)) * 60
-        + float(match.group(3))
-    )
-
-    has_audio = bool(
-        re.search(
-            r"Stream #.*Audio:",
-            stderr,
-        )
-    )
-
-    return duration, has_audio
-
-
-# ============================================================
-# ESTIMATIVA LEVE DE BPM
-# ============================================================
-
-def estimate_bpm(audio_path):
-
-    """
-    Estimativa leve de BPM.
-
-    Não utiliza librosa.
-    """
-
+def audio_end(path,dur,latest_word=0):
+    # Conservative ending: silence detection is only allowed to shorten the file
+    # when a real final silence exists; the last recognized word gets a safety tail.
+    end=dur
+    ff=ffmpeg()
     try:
+        p=subprocess.run([ff,"-hide_banner","-i",path,"-af","silencedetect=noise=-40dB:d=0.55","-f","null","-"],
+                         stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,timeout=max(60,int(dur*2)))
+        starts=[float(x) for x in re.findall(r"silence_start:\s*([\d.]+)",p.stderr)]
+        ends=[float(x) for x in re.findall(r"silence_end:\s*([\d.]+)",p.stderr)]
+        if starts and starts[-1]>dur*.72:
+            end=min(end,starts[-1]+.25)
+    except Exception: pass
+    if latest_word>0:
+        # Do not cut a genuine last syllable; 0.65s is a better safety margin for singing.
+        end=min(end,max(latest_word+.65, dur if dur-latest_word<.35 else latest_word+.65))
+    return max(.5,end)
 
-        import numpy as np
-
-        ff = get_ffmpeg()
-
-        command = [
-            ff,
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-i",
-            str(audio_path),
-            "-t",
-            "18",
-            "-ac",
-            "1",
-            "-ar",
-            "8000",
-            "-f",
-            "s16le",
-            "-",
-            "pipe:1",
-        ]
-
-        result = subprocess.run(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=45,
-        )
-
-        if (
-            result.returncode != 0
-            or not result.stdout
-        ):
-            return 100.0
-
-        audio = np.frombuffer(
-            result.stdout,
-            dtype=np.int16,
-        ).astype(
-            np.float32
-        )
-
-        if len(audio) < 8000:
-            return 100.0
-
-        audio /= 32768.0
-
-        block = 400
-
-        count = (
-            len(audio)
-            // block
-        )
-
-        if count < 30:
-            return 100.0
-
-        envelope = np.zeros(
-            count,
-            dtype=np.float32,
-        )
-
-        for i in range(
-            count
-        ):
-
-            section = audio[
-                i * block:
-                (i + 1) * block
-            ]
-
-            envelope[i] = np.sqrt(
-                np.mean(
-                    section * section
-                )
-                + 1e-9
-            )
-
-        envelope -= np.mean(
-            envelope
-        )
-
-        std = np.std(
-            envelope
-        )
-
-        if std < 1e-6:
-            return 100.0
-
-        envelope /= std
-
-        sample_rate = (
-            8000
-            / block
-        )
-
-        min_bpm = 60
-        max_bpm = 180
-
-        min_lag = int(
-            sample_rate
-            * 60
-            / max_bpm
-        )
-
-        max_lag = int(
-            sample_rate
-            * 60
-            / min_bpm
-        )
-
-        if max_lag >= len(
-            envelope
-        ):
-
-            max_lag = (
-                len(envelope)
-                - 1
-            )
-
-        best_lag = None
-        best_score = -1e9
-
-        for lag in range(
-            min_lag,
-            max_lag + 1,
-        ):
-
-            a = envelope[
-                :-lag
-            ]
-
-            b = envelope[
-                lag:
-            ]
-
-            if len(a) < 10:
-                continue
-
-            score = float(
-                np.mean(a * b)
-            )
-
-            if score > best_score:
-
-                best_score = score
-                best_lag = lag
-
-        if not best_lag:
-            return 100.0
-
-        bpm = (
-            60
-            * sample_rate
-            / best_lag
-        )
-
-        while bpm < 75:
-            bpm *= 2
-
-        while bpm > 160:
-            bpm /= 2
-
-        return float(
-            max(
-                70,
-                min(
-                    160,
-                    bpm,
-                ),
-            )
-        )
-
-    except Exception:
-
-        return 100.0
-
-
-# ============================================================
-# INTRO
-# ============================================================
-
-def calculate_intro_duration(
-    bpm,
-    first_lyric_start,
-):
-
-    bpm = max(
-        70.0,
-        min(
-            160.0,
-            float(bpm),
-        ),
-    )
-
-    beat = (
-        60.0 / bpm
-    )
-
-    desired = (
-        beat * 2.0
-    )
-
-    desired = max(
-        0.85,
-        min(
-            2.40,
-            desired,
-        ),
-    )
-
-    if (
-        first_lyric_start is not None
-        and first_lyric_start > 0.65
-    ):
-
-        desired = min(
-            desired,
-            max(
-                0.55,
-                first_lyric_start - 0.05,
-            ),
-        )
-
-    return desired
-
-
-def smoothstep(value):
-
-    value = max(
-        0.0,
-        min(
-            1.0,
-            value,
-        ),
-    )
-
-    return (
-        value
-        * value
-        * (
-            3
-            - 2 * value
-        )
-    )
-
-
-@st.cache_data(
-    show_spinner=False
-)
-def load_logo_from_file():
-
-    candidates = [
-
-        Path(
-            "logo_perfil.png"
-        ),
-
-        Path(
-            "logo.png"
-        ),
-
-    ]
-
-    for path in candidates:
-
-        if path.exists():
-
+@st.cache_resource(show_spinner=False)
+def fonts():
+    out={}
+    for name,url in FONT_SOURCES.items():
+        p=FONT_DIR/(safe(name)+".ttf")
+        if not p.exists() or p.stat().st_size<10000:
             try:
+                req=urllib.request.Request(url,headers={"User-Agent":"LyricAIStudio"})
+                with urllib.request.urlopen(req,timeout=25) as r:p.write_bytes(r.read())
+            except Exception: pass
+        if p.exists() and p.stat().st_size>10000: out[name]=str(p)
+    if not out:
+        for p in SYSTEM_FONTS:
+            if os.path.exists(p): out["System"]=p; break
+    return out
 
-                image = Image.open(
-                    path
-                ).convert(
-                    "RGBA"
-                )
+def fit_font(text,maxw,size,path,minsize=34):
+    while size>=minsize:
+        f=ImageFont.truetype(path,size)
+        b=f.getbbox(text)
+        if b[2]-b[0]<=maxw:return f
+        size-=2
+    return ImageFont.truetype(path,minsize)
 
-                return image
+@st.cache_resource(show_spinner=False)
+def whisper(model):
+    from faster_whisper import WhisperModel
+    return WhisperModel(model,device="cpu",compute_type="int8",
+                        cpu_threads=max(2,min(8,os.cpu_count() or 4)),num_workers=1)
 
-            except Exception:
-                pass
-
-    return None
-
-
-def resize_logo(
-    logo,
-    max_width=460,
-    max_height=380,
-):
-
-    if logo is None:
-        return None
-
-    image = logo.copy()
-
-    ratio = min(
-        max_width
-        / image.width,
-        max_height
-        / image.height,
-        1.0,
+def transcribe(path,model,status=None):
+    m=whisper(model)
+    if status: status.write(f"ðï¸ Transcrevendo palavra por palavra com **{model}**â¦")
+    segs,info=m.transcribe(
+        path,language="pt",task="transcribe",
+        beam_size=8,best_of=8,patience=1.2,
+        temperature=0.0,compression_ratio_threshold=2.8,
+        log_prob_threshold=-1.2,no_speech_threshold=0.20,
+        condition_on_previous_text=True,vad_filter=False,
+        word_timestamps=True,
+        initial_prompt=("Letra de mÃºsica brasileira cantada em portuguÃªs. "
+                        "ReconheÃ§a palavras curtas e rÃ¡pidas, repetiÃ§Ãµes e contraÃ§Ãµes. "
+                        "NÃ£o resuma nem traduza.")
     )
-
-    if ratio < 1:
-
-        image = image.resize(
-            (
-                int(
-                    image.width
-                    * ratio
-                ),
-                int(
-                    image.height
-                    * ratio
-                ),
-            ),
-            Image.Resampling.LANCZOS,
-        )
-
-    return image
-
-
-def draw_intro_frame(
-    logo,
-    time_position,
-    intro_duration,
-):
-
-    image = Image.new(
-        "RGBA",
-        (W, H),
-        BLACK + (255,),
-    )
-
-    draw = ImageDraw.Draw(
-        image
-    )
-
-    if intro_duration <= 0:
-
-        return image.convert(
-            "RGB"
-        )
-
-    progress = (
-        time_position
-        / intro_duration
-    )
-
-    progress = max(
-        0.0,
-        min(
-            1.0,
-            progress,
-        ),
-    )
-
-    # --------------------------------------------------------
-    # LOGO
-    # --------------------------------------------------------
-
-    logo = resize_logo(
-        logo
-    )
-
-    if logo is not None:
-
-        logo_end = 0.42
-
-        if progress < logo_end:
-
-            logo_progress = (
-                progress
-                / logo_end
-            )
-
-            logo_alpha = int(
-                255
-                * (
-                    1
-                    - smoothstep(
-                        logo_progress
-                    )
-                    * 0.85
-                )
-            )
-
-            logo_layer = (
-                logo.copy()
-            )
-
-            if logo_layer.mode != "RGBA":
-
-                logo_layer = (
-                    logo_layer.convert(
-                        "RGBA"
-                    )
-                )
-
-            alpha = (
-                logo_layer
-                .getchannel(
-                    "A"
-                )
-            )
-
-            alpha = alpha.point(
-                lambda p:
-                int(
-                    p
-                    * logo_alpha
-                    / 255
-                )
-            )
-
-            logo_layer.putalpha(
-                alpha
-            )
-
-            x = (
-                W
-                - logo_layer.width
-            ) // 2
-
-            y = (
-                H
-                - logo_layer.height
-            ) // 2
-
-            image.alpha_composite(
-                logo_layer,
-                (
-                    x,
-                    y,
-                ),
-            )
-
-    # --------------------------------------------------------
-    # CÍRCULO BRANCO
-    # --------------------------------------------------------
-
-    circle_start = 0.25
-
-    if progress >= circle_start:
-
-        circle_progress = (
-            progress
-            - circle_start
-        ) / (
-            1.0
-            - circle_start
-        )
-
-        circle_progress = smoothstep(
-            circle_progress
-        )
-
-        max_radius = math.sqrt(
-            (
-                W / 2
-            ) ** 2
-            + (
-                H / 2
-            ) ** 2
-        )
-
-        radius = (
-            max_radius
-            * circle_progress
-        )
-
-        cx = W // 2
-        cy = H // 2
-
-        draw.ellipse(
-            (
-                int(
-                    cx - radius
-                ),
-                int(
-                    cy - radius
-                ),
-                int(
-                    cx + radius
-                ),
-                int(
-                    cy + radius
-                ),
-            ),
-            fill=WHITE + (255,),
-        )
-
-    return image.convert(
-        "RGB"
-    )
-
-
-# ============================================================
-# WHISPER
-# ============================================================
-
-@st.cache_resource(
-    show_spinner=False
-)
-def load_whisper(
-    model_name
-):
-
-    from faster_whisper import (
-        WhisperModel
-    )
-
-    return WhisperModel(
-        model_name,
-        device="cpu",
-        compute_type="int8",
-        cpu_threads=2,
-        num_workers=1,
-    )
-
-
-def transcribe(
-    path,
-    model_name,
-    status,
-):
-
-    model = load_whisper(
-        model_name
-    )
-
-    status.write(
-        f"Transcrevendo com "
-        f"**{model_name}**..."
-    )
-
-    segments_iter, info = (
-        model.transcribe(
-            str(path),
-            language="pt",
-            task="transcribe",
-            word_timestamps=True,
-            beam_size=5,
-            best_of=5,
-            temperature=0.0,
-            condition_on_previous_text=True,
-            vad_filter=False,
-            initial_prompt=(
-                "Letra de música brasileira "
-                "em português. "
-                "Reconheça todas as palavras "
-                "exatamente como são cantadas, "
-                "inclusive repetições, gírias, "
-                "contrações e acentos. "
-                "Não traduza."
-            ),
-        )
-    )
-
-    segments = []
-    words = []
-
-    for segment in segments_iter:
-
-        start = float(
-            segment.start
-        )
-
-        end = float(
-            segment.end
-        )
-
-        text = clean_text(
-            segment.text
-        )
-
-        if (
-            text
-            and end > start
-        ):
-
-            segments.append(
-                {
-                    "start": start,
-                    "end": end,
-                    "text": text,
-                }
-            )
-
-        for word in (
-            segment.words
-            or []
-        ):
-
-            word_text = clean_text(
-                word.word
-            )
-
-            if not word_text:
-                continue
-
-            if (
-                word.start is None
-                or word.end is None
-            ):
-                continue
-
-            word_start = float(
-                word.start
-            )
-
-            word_end = float(
-                word.end
-            )
-
-            if (
-                word_end
-                <= word_start
-            ):
-                continue
-
-            words.append(
-                {
-                    "word": word_text,
-                    "start": word_start,
-                    "end": word_end,
-                }
-            )
-
-    return (
-        segments,
-        words,
-        getattr(
-            info,
-            "language",
-            "pt",
-        )
-        or "pt",
-    )
-
-
-# ============================================================
-# FALLBACK DESATIVADO
-# ============================================================
-
-def distribute_words(
-    *args,
-    **kwargs,
-):
-
-    """
-    NÃO distribui mais o tempo da frase.
-
-    Mantida somente para compatibilidade
-    com versões anteriores.
-
-    Retorna lista vazia propositalmente.
-    """
-
-    return []
-
-
-# ============================================================
-# SIMILARIDADE
-# ============================================================
-
-def similarity(
-    a,
-    b,
-):
-
-    import difflib
-
-    aa = normalize_for_match(
-        a
-    )
-
-    bb = normalize_for_match(
-        b
-    )
-
-    if not aa or not bb:
-
-        return 0.0
-
-    if aa == bb:
-
-        return 1.0
-
-    return difflib.SequenceMatcher(
-        None,
-        aa,
-        bb,
-        autojunk=False,
-    ).ratio()
-
-
-# ============================================================
-# ALINHAMENTO REAL DAS PALAVRAS
-# ============================================================
-
-def align_phrase(
-    text,
-    start,
-    end,
-    asr_words,
-):
-
-    """
-    A letra oficial define:
-
-        INÍCIO da frase
-        FIM da frase
-
-    O Whisper define:
-
-        INÍCIO de cada palavra
-        FIM de cada palavra
-
-    NÃO existe divisão matemática do tempo.
-
-    NÃO existe:
-
-        duração / número_de_palavras
-
-    Cada palavra precisa ser encontrada
-    no áudio reconhecido.
-    """
-
-    tokens = re.findall(
-        r"\S+",
-        clean_text(
-            text
-        ),
-    )
-
-    if not tokens:
-
-        return []
-
-    # --------------------------------------------------------
-    # PALAVRAS CANDIDATAS
-    # --------------------------------------------------------
-
-    candidates = [
-        word
-        for word in asr_words
-        if (
-            word["end"]
-            > start - 0.35
-        )
-        and (
-            word["start"]
-            < end + 0.35
-        )
-    ]
-
-    if not candidates:
-
-        return []
-
-    result = []
-
-    candidate_index = 0
-
-    # --------------------------------------------------------
-    # BUSCA SEQUENCIAL
-    # --------------------------------------------------------
-
-    for token in tokens:
-
-        best_index = None
-        best_score = 0.0
-
-        search_end = min(
-            len(candidates),
-            candidate_index + 10,
-        )
-
-        for j in range(
-            candidate_index,
-            search_end,
-        ):
-
-            candidate = candidates[
-                j
-            ]
-
-            score = similarity(
-                token,
-                candidate["word"],
-            )
-
-            normalized_token = (
-                normalize_for_match(
-                    token
-                )
-            )
+    words=[]
+    for seg in segs:
+        if not seg.words: continue
+        for w in seg.words:
+            x=norm(w.word)
+            if x:
+                words.append({"word":x,"start":float(w.start),"end":float(w.end),
+                              "prob":float(getattr(w,"probability",0) or 0)})
+    return words,getattr(info,"language","pt"),float(getattr(info,"duration",0) or 0)
+
+def parse_timed(text):
+    out=[]
+    for line in text.splitlines():
+        line=line.strip()
+        if not line: continue
+        m=re.match(r"^(?:(\d+):)?(\d{1,2}):(\d{2})(?:[.,](\d{1,3}))?\s*\|\s*(.+)$",line)
+        if m:
+            h=int(m.group(1) or 0); mi=int(m.group(2)); se=int(m.group(3)); fr=m.group(4) or "0"
+            out.append({"start":h*3600+mi*60+se+float("0."+fr),"text":norm(m.group(5))})
+            continue
+        m=re.match(r"^(\d+(?:[.,]\d+)?)\s*\|\s*(.+)$",line)
+        if m: out.append({"start":float(m.group(1).replace(",",".")),"text":norm(m.group(2))})
+    out.sort(key=lambda x:x["start"])
+    return out
+
+def plain_lines(text):
+    return [norm(x) for x in text.splitlines() if norm(x)]
+
+def align_phrase(text, start, end, asr):
+    toks=re.findall(r"\S+",text)
+    cand=[(i,w) for i,w in enumerate(asr) if w["end"]>=start-.25 and w["start"]<=end+.25]
+    n=len(toks); m=len(cand)
+    if not n:return []
+    # Dynamic programming monotonic alignment. Skips ASR words when Whisper invents
+    # extras and skips lyric tokens when Whisper misses them.
+    dp=np.full((n+1,m+1),-1e9,float); back=np.zeros((n+1,m+1),np.int8)
+    dp[0,:]=0
+    for i in range(1,n+1):
+        for j in range(1,m+1):
+            sc=sim(toks[i-1],cand[j-1][1]["word"])
+            match=dp[i-1,j-1]+(4.0*sc-0.20)
+            skip_lyric=dp[i-1,j]-0.65
+            skip_asr=dp[i,j-1]-0.18
+            best=max(match,skip_lyric,skip_asr)
+            dp[i,j]=best
+            back[i,j]=1 if best==match else (2 if best==skip_lyric else 3)
+    i,j=n,m; matches={}
+    while i>0 and j>0:
+        b=back[i,j]
+        if b==1:
+            score=sim(toks[i-1],cand[j-1][1]["word"])
+            if score>=.38: matches[i-1]=cand[j-1][1]
+            i-=1;j-=1
+        elif b==2:i-=1
+        else:j-=1
+    # Interpolate missing lyric words only inside this phrase.
+    result=[None]*n
+    for i,w in matches.items(): result[i]={"word":toks[i],"start":w["start"],"end":w["end"],
+                                           "prob":max(w.get("prob",0),sim(toks[i],w["word"])*.75)}
+    known=[i for i,x in enumerate(result) if x]
+    for i in range(n):
+        if result[i]:continue
+        prev=max([k for k in known if k<i],default=-1)
+        nxt=min([k for k in known if k>i],default=n)
+        a=result[prev]["end"] if prev>=0 else start
+        b=result[nxt]["start"] if nxt<n else end
+        count=max(1,nxt-prev)
+        st=a+(b-a)*(i-prev)/count
+        en=a+(b-a)*(i-prev+1)/count
+        result[i]={"word":toks[i],"start":clamp(st,start,end),"end":clamp(max(st+.055,en),start+.055,end),"prob":.45}
+    for w in result:
+        w["start"]=clamp(w["start"],start,end)
+        w["end"]=clamp(max(w["start"]+.055,w["end"]),w["start"]+.055,end)
+    return result
+
+def build_timed(lines,asr,aend):
+    scenes=[]
+    for i,line in enumerate(lines):
+        st=line["start"]
+        if st>=aend:break
+        en=min(lines[i+1]["start"] if i+1<len(lines) else aend,aend)
+        if en<=st+.05:continue
+        words=align_phrase(line["text"],st,en,asr)
+        if not words:continue
+        for w in words:w["phrase_id"]=i;w["phrase_text"]=line["text"]
+        scenes.append({"start":max(0,st-.025),"end":min(aend,en+.18),
+                       "words":words,"phrase_text":line["text"],"instrumental":False})
+    return scenes
+
+def build_plain(text,asr,aend):
+    lines=plain_lines(text)
+    scenes=[]; cursor=0
+    for pid,line in enumerate(lines):
+        toks=re.findall(r"\S+",line)
+        if not toks:continue
+        # Find the first few tokens monotonically; phrase boundaries come from ASR.
+        best=None; score=0
+        for j in range(cursor,min(len(asr),cursor+45)):
+            s=sim(toks[0],asr[j]["word"])
+            if s>score:score=s;best=j
+        if best is None or score<.35:continue
+        st=asr[best]["start"]; idx=best
+        # Estimate end by greedily matching the rest, but never allow a huge jump.
+        for tok in toks[1:]:
+            bi=None;bs=0
+            for j in range(idx+1,min(len(asr),idx+25)):
+                s=sim(tok,asr[j]["word"])
+                if s>bs:bs=s;bi=j
+                if s>=.98:break
+            if bi is not None and bs>=.35:idx=bi
+        en=min(aend,asr[idx]["end"]+.18)
+        words=align_phrase(line,st,en,asr)
+        if words:
+            for w in words:w["phrase_id"]=pid;w["phrase_text"]=line
+            scenes.append({"start":max(0,st-.025),"end":en,"words":words,
+                           "phrase_text":line,"instrumental":False})
+            cursor=idx+1
+    return scenes
+
+EMOTIONAL={"amor","saudade","coraÃ§Ã£o","coracao","beijo","vida","nunca","sempre","volta","voltar",
+           "paixÃ£o","paixao","desejo","perfume","chora","chorar","quero","meu","minha","tudo","nada","vocÃª","voce"}
+
+@dataclass
+class Style:
+    bg:Tuple[int,int,int]; fg:Tuple[int,int,int]; font:str; layout:str; blue:bool
+
+def style_for(scene,idx,reg):
+    s=sum(ord(c) for c in scene.get("phrase_text",""))+idx*37
+    bg=[BLACK,BLACK,BLACK2,(20,20,22),(245,245,243)][s%5]
+    fg=WHITE if sum(bg)<300 else BLACK
+    available=[x for x in ["Anton","Bebas Neue","Archivo Black","Montserrat","Oswald","DM Serif Display","Playfair Display","Libre Baskerville"] if x in reg]
+    font=available[s%len(available)] if available else next(iter(reg))
+    # Stack more often for long phrases; otherwise varied but controlled.
+    n=len(scene.get("words",[]))
+    if n>=9: layout="stack" if s%2==0 else "center"
+    elif n>=6: layout=["center","stack","editorial"][s%3]
+    else: layout=["hero","center","editorial"][s%3]
+    return Style(bg,fg,font,layout,(s%4==0))
+
+def background(style,t):
+    arr=np.zeros((H,W,3),np.float32);arr[:]=style.bg
+    yy,xx=np.mgrid[0:H,0:W]
+    # monochromatic moving light only; no colored background.
+    cx=W*(.5+.10*math.sin(t*.23)); cy=H*(.48+.08*math.cos(t*.31))
+    d=((xx-cx)/(W*.65))**2+((yy-cy)/(H*.65))**2
+    glow=np.exp(-2.2*d)[...,None]
+    if sum(style.bg)<300: arr+=glow*7
+    else: arr-=glow*7
+    rng=np.random.default_rng(int(t*997)%1000003)
+    arr+=rng.normal(0,1.3,(H,W,1))
+    return Image.fromarray(np.uint8(np.clip(arr,0,255)))
+
+def choose_blue(words,enabled,seed):
+    if not enabled or seed%3: return set()
+    scored=[]
+    for i,w in enumerate(words):
+        x=token(w["word"]); sc=len(x)*.3+(4 if x in EMOTIONAL else 0)+(1.5 if len(x)>=8 else 0)
+        scored.append((sc,i))
+    scored.sort(reverse=True)
+    return {scored[0][1]} if scored else set()
+
+def draw_text_layer(text,font,color,alpha=255,scale=1.0,glow=False):
+    b=font.getbbox(text);tw=b[2]-b[0];th=b[3]-b[1];pad=50
+    layer=Image.new("RGBA",(tw+pad*2,th+pad*2),(0,0,0,0));d=ImageDraw.Draw(layer)
+    if glow:
+        for sw,a in ((12,18),(7,28),(3,42)):
+            d.text((pad,pad),text,font=font,fill=(*color,a),stroke_width=sw,stroke_fill=(*color,a))
+    d.text((pad,pad),text,font=font,fill=(*color,int(alpha)))
+    if scale!=1:
+        layer=layer.resize((int(layer.width*scale),int(layer.height*scale)),Image.Resampling.LANCZOS)
+    return layer
+
+def render_words(overlay,scene,font_path,style,local):
+    words=scene["words"]; spoken=[(i,w,w["start"]-scene["start"]) for i,w in enumerate(words) if local>=w["start"]-scene["start"]-.01]
+    if not spoken:return
+    d=ImageDraw.Draw(overlay)
+    blue=choose_blue(words,style.blue,hash(scene["phrase_text"])%1000)
+    n=len(spoken)
+    maxw=int(W*.88)
+    # Large typography. Long phrases use stacked words deliberately.
+    if style.layout=="stack":
+        size=int(H*.078 if n<10 else H*.069)
+        f=fit_font("WWWWWWWW",int(W*.72),size,font_path,34)
+        visible=spoken[-9:]
+        lh=int(f.size*1.02); total=lh*len(visible); y=H/2-total/2
+        for i,w,rel in visible:
+            word=w["word"].upper();age=local-rel;p=ease(age/.22)
+            col=ROYAL if i in blue else style.fg
+            layer=draw_text_layer(word,f,col,int(255*p),.94+.06*p,glow=(i in blue))
+            x=int((W-layer.width)/2); yy=int(y+(1-p)*22)
+            overlay.alpha_composite(layer,(x,yy)); y+=lh
+        return
+    # center/editorial/hero: wrap by actual pixels.
+    size=int(H*.090 if n<=3 else H*.080 if n<=6 else H*.068)
+    # Fit each token, not the entire phrase, preserving large words.
+    f=fit_font("W"*max(5,max(len(w["word"]) for _,w,_ in spoken)),int(W*.82),size,font_path,32)
+    rows=[];row=[];rw=0;space=d.textbbox((0,0)," ",font=f)[2]
+    for item in spoken:
+        ww=d.textbbox((0,0),item[1]["word"].upper(),font=f)[2]
+        if row and rw+space+ww>maxw:
+            rows.append((row,rw));row=[item];rw=ww
+        else:
+            rw += ww+(space if row else 0);row.append(item)
+    if row:rows.append((row,rw))
+    lh=int(f.size*1.08); y=H/2-(len(rows)*lh)/2
+    for ri,(row,rw) in enumerate(rows):
+        x=(W-rw)/2
+        for i,w,rel in row:
+            word=w["word"].upper();ww=d.textbbox((0,0),word,font=f)[2]
+            age=local-rel;p=ease(age/.22);col=ROYAL if i in blue else style.fg
+            # subtle, fluid entrance: fade + 10px rise + tiny scale.
+            layer=draw_text_layer(word,f,col,int(255*p),.965+.035*p,glow=(i in blue))
+            overlay.alpha_composite(layer,(int(x-(layer.width-ww)/2),int(y+(1-p)*10-42)))
+            x+=ww+space
+        y+=lh
+
+def render_frame(scene,style,reg,local,t):
+    base=background(style,t).convert("RGBA")
+    overlay=Image.new("RGBA",(W,H),(0,0,0,0));d=ImageDraw.Draw(overlay)
+    # monochrome decorative motion
+    a=int(18+12*(.5+.5*math.sin(t*1.7)))
+    d.ellipse((W*.12,H*.18,W*.88,H*.82),outline=style.fg+(a,),width=3)
+    d.line((W*.10,H*.84,W*(.35+.08*math.sin(t*.8)),H*.84),fill=style.fg+(35,),width=4)
+    font_path=reg[style.font]
+    render_words(overlay,scene,font_path,style,local)
+    dur=max(.1,scene["end"]-scene["start"])
+    # phrase-level fade; no hard pop between phrases
+    fade=.20
+    if local<fade:
+        aa=int(255*smooth(local/fade))
+        overlay.putalpha(overlay.getchannel("A").point(lambda x:int(x*aa/255)))
+    if dur-local<fade:
+        aa=int(255*smooth(max(0,(dur-local)/fade)))
+        overlay.putalpha(overlay.getchannel("A").point(lambda x:int(x*aa/255)))
+    return Image.alpha_composite(base,overlay).convert("RGB")
+
+def render_video(audio_path,scenes,reg,out_path,res,quality,progress):
+    ww,hh=res
+    global W,H; W,H=ww,hh
+    dur=duration(audio_path)
+    last=max((w["end"] for s in scenes for w in s.get("words",[])),default=0)
+    end=audio_end(audio_path,dur,last)
+    # If supplied timed lyrics contain lines after the last sung phrase, they are
+    # automatically ignored because the audio/ASR never reaches them.
+    end=min(end,last+.65) if last else end
+    ff=ffmpeg(); silent=Path(out_path).with_name("silent.mp4")
+    crf="13" if quality=="Alta qualidade" else "16"
+    preset="slow" if quality=="Alta qualidade" else "medium"
+    cmd=[ff,"-y","-f","rawvideo","-pix_fmt","rgb24","-s",f"{ww}x{hh}","-r",str(FPS),"-i","-",
+         "-an","-c:v","libx264","-preset",preset,"-crf",crf,"-pix_fmt","yuv420p","-profile:v","high",
+         "-movflags","+faststart",str(silent)]
+    p=subprocess.Popen(cmd,stdin=subprocess.PIPE,stderr=subprocess.PIPE)
+    total=max(1,int(math.ceil(end*FPS)));si=0
+    try:
+        for fi in range(total):
+            t=fi/FPS
+            while si+1<len(scenes) and t>=scenes[si]["end"]:si+=1
+            if not scenes: scene={"start":0,"end":end,"words":[],"phrase_text":""}
+            else: scene=scenes[min(si,len(scenes)-1)]
+            style=style_for(scene,si,reg)
+            local=clamp(t-scene["start"],0,max(.01,scene["end"]-scene["start"]))
+            frame=np.asarray(render_frame(scene,style,reg,local,t),np.uint8)
+            p.stdin.write(frame.tobytes())
+            if progress and fi%FPS==0:progress.progress(min(.94,fi/total*.94),text=f"Renderizando {int(fi/total*100)}%")
+        p.stdin.close()
+        err=p.stderr.read().decode("utf8","replace");code=p.wait()
+        if code:raise RuntimeError(err[-7000:])
+    finally:
+        if p.poll() is None:
+            try:p.kill()
+            except:pass
+    run([ff,"-y","-i",str(silent),"-i",audio_path,"-map","0:v:0","-map","1:a:0",
+         "-c:v","copy","-c:a","aac","-b:a","256k","-t",f"{end:.3f}","-movflags","+faststart",str(out_path)],
+        timeout=max(180,int(end*10)))
+    silent.unlink(missing_ok=True)
+    if progress:progress.progress(1.0,text="â VÃ­deo concluÃ­do.")
+    return end
+
+st.set_page_config(page_title="Lyric AI Studio",page_icon="ðµ",layout="centered")
+st.title("ðµ Lyric AI Studio")
+st.caption(f"Royal Kinetic Word-Sync Â· {APP_VERSION}")
+with st.expander("Como obter a melhor sincronizaÃ§Ã£o",expanded=False):
+    st.markdown("""Cole a letra oficial. Para mÃ¡xima precisÃ£o, use:
+`00:12.30 | primeira frase`
+`00:16.80 | segunda frase`
+`00:21.45 | terceira frase`
+
+O tempo Ã© o inÃ­cio da frase. O Whisper procura as palavras dentro dessa janela.
+Se a letra continuar depois do fim real da mÃºsica, ela serÃ¡ ignorada.""")
+audio=st.file_uploader("1. MÃºsica ou vÃ­deo com a mÃºsica",type=["mp3","wav","m4a","mp4","mov","webm"])
+lyrics=st.text_area("2. Letra oficial (recomendada)",height=230,
+                    placeholder="00:12.30 | Eu sei que vou te amar\n00:16.80 | Por toda a minha vida\n00:21.45 | Eu vou te amar")
+col1,col2=st.columns(2)
+with col1:model=st.selectbox("Reconhecimento",["small","medium","large-v3-turbo","large-v3"],index=2)
+with col2:quality=st.selectbox("Qualidade",["Alta qualidade","Equilibrado"],index=0)
+resolution=st.selectbox("ResoluÃ§Ã£o",["1080Ã1920","720Ã1280"],index=0)
+reg=fonts()
+st.caption(f"Fontes disponÃ­veis: {len(reg)}")
+if st.button("ð CRIAR LYRIC VIDEO",type="primary",use_container_width=True):
+    if not audio:st.error("Envie a mÃºsica primeiro.");st.stop()
+    tmp=Path(tempfile.mkdtemp(prefix="lyric_ai_"));status=st.empty();bar=st.progress(0)
+    try:
+        ap=tmp/safe(audio.name);ap.write_bytes(audio.getbuffer())
+        dur=duration(str(ap))
+        try: asr,lang,dd=transcribe(str(ap),model,status)
+        except Exception:
+            if model=="small":raise
+            status.warning("Tentando o modelo small por seguranÃ§aâ¦")
+            asr,lang,dd=transcribe(str(ap),"small",status)
+        if not asr:raise RuntimeError("O reconhecimento nÃ£o encontrou palavras. Tente large-v3 ou forneÃ§a a letra com tempos.")
+        timed=parse_timed(lyrics) if lyrics.strip() else []
+        aend=audio_end(str(ap),dur,max((w["end"] for w in asr),default=0))
+        if timed:
+            status.write("ð§© Alinhando a letra oficial Ã s palavras reais do cantorâ¦")
+            scenes=build_timed(timed,asr,aend)
+        elif lyrics.strip():
+            status.write("ð§© Alinhando a letra oficial ao Ã¡udioâ¦")
+            scenes=build_plain(lyrics,asr,aend)
+        else:
+            scenes=[]
+            cur=[]
+            for w in asr:
+                if w["start"]>=aend:break
+                if cur and (w["start"]-cur[-1]["end"]>.58 or len(cur)>=15 or w["end"]-cur[0]["start"]>7):
+                    scenes.append(cur);cur=[]
+                cur.append(w)
+            if cur:scenes.append(cur)
+            scenes=[{"start":x[0]["start"],"end":min(aend,x[-1]["end"]+.18),"words":x,
+                     "phrase_text":" ".join(w["word"] for w in x),"instrumental":False} for x in scenes]
+        scenes=[s for s in scenes if s["start"]<aend and s["words"]]
+        if not scenes:raise RuntimeError("NÃ£o foi possÃ­vel alinhar as frases ao Ã¡udio. Use a letra com timestamps.")
+        bar.progress(.15,text="Preparando renderâ¦")
+        res=(1080,1920) if resolution.startswith("1080") else (720,1280)
+        out=tmp/"lyric_ai_final.mp4"
+        final_end=render_video(str(ap),scenes,reg,str(out),res,quality,bar)
+        status.success(f"VÃ­deo criado atÃ© {final_end:.2f}s â apenas atÃ© o trecho realmente cantado.")
+        st.video(str(out))
+        st.download_button("â¬ï¸ Baixar MP4",out.read_bytes(),"lyric_ai_final.mp4","video/mp4",use_container_width=True)
+        with st.expander("DiagnÃ³stico"):
+            st.write(f"Palavras ASR: **{len(asr)}**")
+            st.write(f"Frases renderizadas: **{len(scenes)}**")
+            st.write(f"Fim detectado: **{final_end:.2f}s**")
+            st.write(f"Idioma: **{lang}**")
+    except Exception as e:
+        st.error("A geraÃ§Ã£o falhou.")
+        st.code(str(e))
+    # keep tmp alive for this Streamlit run
