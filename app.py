@@ -143,18 +143,34 @@ def transcribe(path,model,status=None):
                               "prob":float(getattr(w,"probability",0) or 0)})
     return words,getattr(info,"language","pt"),float(getattr(info,"duration",0) or 0)
 
+_TIMED_RANGE_RE = re.compile(
+    r"^(?:(?P<h1>\d+):)?(?P<m1>\d{1,2}):(?P<s1>\d{2})(?:[.,](?P<f1>\d{1,3}))?"
+    r"(?:\s*-\s*(?:(?P<h2>\d+):)?(?P<m2>\d{1,2}):(?P<s2>\d{2})(?:[.,](?P<f2>\d{1,3}))?)?"
+    r"\s*\|\s*(?P<text>.+)$"
+)
+_TIMED_PLAIN_RE = re.compile(r"^(?P<sec>\d+(?:[.,]\d+)?)\s*\|\s*(?P<text>.+)$")
+
+def _ts(h,m,s,f):
+    return int(h or 0)*3600+int(m)*60+int(s)+float("0."+(f or "0"))
+
 def parse_timed(text):
+    # Accepts either "início | frase" or "início - fim | frase" (mm:ss.mmm or hh:mm:ss.mmm).
+    # When an explicit end is given, it is used directly instead of being inferred
+    # from the next line's start.
     out=[]
     for line in text.splitlines():
         line=line.strip()
         if not line: continue
-        m=re.match(r"^(?:(\d+):)?(\d{1,2}):(\d{2})(?:[.,](\d{1,3}))?\s*\|\s*(.+)$",line)
+        m=_TIMED_RANGE_RE.match(line)
         if m:
-            h=int(m.group(1) or 0); mi=int(m.group(2)); se=int(m.group(3)); fr=m.group(4) or "0"
-            out.append({"start":h*3600+mi*60+se+float("0."+fr),"text":norm(m.group(5))})
+            start=_ts(m.group("h1"),m.group("m1"),m.group("s1"),m.group("f1"))
+            end=_ts(m.group("h2"),m.group("m2"),m.group("s2"),m.group("f2")) if m.group("m2") is not None else None
+            entry={"start":start,"text":norm(m.group("text"))}
+            if end is not None and end>start: entry["end"]=end
+            out.append(entry)
             continue
-        m=re.match(r"^(\d+(?:[.,]\d+)?)\s*\|\s*(.+)$",line)
-        if m: out.append({"start":float(m.group(1).replace(",",".")),"text":norm(m.group(2))})
+        m=_TIMED_PLAIN_RE.match(line)
+        if m: out.append({"start":float(m.group("sec").replace(",",".")),"text":norm(m.group("text"))})
     out.sort(key=lambda x:x["start"])
     return out
 
@@ -213,7 +229,12 @@ def build_timed(lines,asr,aend):
     for i,line in enumerate(lines):
         st=line["start"]
         if st>=aend:break
-        en=min(lines[i+1]["start"] if i+1<len(lines) else aend,aend)
+        # Prefer the explicit end the user typed; fall back to the next line's
+        # start (or aend) when only a single timestamp was given per line.
+        if line.get("end") is not None:
+            en=min(line["end"],aend)
+        else:
+            en=min(lines[i+1]["start"] if i+1<len(lines) else aend,aend)
         if en<=st+.05:continue
         words=align_phrase(line["text"],st,en,asr)
         if not words:continue
