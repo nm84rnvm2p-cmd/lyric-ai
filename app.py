@@ -483,3 +483,4 @@ if st.button("🚀 INICIAR DIREÇÃO AUTOMÁTICA", type="primary", use_container
     except Exception as e:
         st.error("Erro na Edição Automática.")
         st.code(str(e))
+
