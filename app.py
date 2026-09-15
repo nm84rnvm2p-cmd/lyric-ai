@@ -17,12 +17,11 @@ FONT_DIR = CACHE / "fonts"
 FONT_DIR.mkdir(parents=True, exist_ok=True)
 
 # Tipografia selecionada a dedo para Direção de Arte Elegante
+# (reduzida às 2 fontes que o app realmente usa em style_for — Playfair para elegância,
+# Anton para energia — para cortar downloads e memória de fontes carregadas em runtime)
 FONT_SOURCES = {
     "Anton": "https://raw.githubusercontent.com/google/fonts/main/ofl/anton/Anton-Regular.ttf",
     "Playfair Display": "https://raw.githubusercontent.com/google/fonts/main/ofl/playfairdisplay/PlayfairDisplay%5Bwght%5D.ttf",
-    "Montserrat": "https://raw.githubusercontent.com/google/fonts/main/ofl/montserrat/Montserrat%5Bwght%5D.ttf",
-    "DM Serif Display": "https://raw.githubusercontent.com/google/fonts/main/ofl/dmserifdisplay/DMSerifDisplay-Regular.ttf",
-    "Bebas Neue": "https://raw.githubusercontent.com/google/fonts/main/ofl/bebasneue/BebasNeue-Regular.ttf"
 }
 
 # Paleta Sofisticada
@@ -93,7 +92,10 @@ def fonts():
 @st.cache_resource(show_spinner=False)
 def whisper(model):
     from faster_whisper import WhisperModel
-    return WhisperModel(model, device="cpu", compute_type="int8", cpu_threads=max(2, min(8, os.cpu_count() or 4)), num_workers=1)
+    # cpu_threads fixo e baixo: no plano gratuito só há ~1 vCPU disponível, então
+    # pedir mais threads (via os.cpu_count() do host) só gera troca de contexto e
+    # pressão extra de memória sem ganho real de velocidade.
+    return WhisperModel(model, device="cpu", compute_type="int8", cpu_threads=2, num_workers=1)
 
 def transcribe(path, model, status=None):
     m = whisper(model)
@@ -259,17 +261,29 @@ def get_word_hierarchy(words):
 # ==========================================
 # RENDERIZAÇÃO GRÁFICA (The Editor)
 # ==========================================
+_WORD_LAYER_CACHE: Dict[Any, Tuple[Any, int, int]] = {}
+
 def draw_text_with_shadow(text, font, color, alpha=255, scale=1.0):
     """ Text rendering com Soft Drop Shadow garantindo legibilidade em qualquer fundo """
+    # Cache por palavra: em regime estável (texto já "assentado", sem crescimento nem
+    # fade) o mesmo (texto, fonte, cor, alpha, escala) se repete em dezenas de frames
+    # seguidos. Sem cache, o multipass de sombra abaixo (várias chamadas de d.text com
+    # stroke_width alto) é redesenhado do zero 30x por segundo por palavra — é o maior
+    # consumidor de CPU do render. Arredondar scale/alpha mantém a variação suave nas
+    # janelas de transição (ataque/fade) sem explodir o número de chaves no cache.
+    key = (id(font), text, color[:3], round(alpha), round(scale, 3))
+    cached = _WORD_LAYER_CACHE.get(key)
+    if cached is not None:
+        return cached
+
     b = font.getbbox(text); tw = b[2]-b[0]; th = b[3]-b[1]; pad = 30
     layer = Image.new("RGBA", (tw+pad*2, th+pad*2), (0,0,0,0))
     d = ImageDraw.Draw(layer)
     
-    # Multipass soft shadow 
+    # Sombra suave (uma passada única em vez do multipass original — a diferença visual
+    # é mínima, mas corta drasticamente o número de chamadas de desenho por palavra)
     shadow_col = (0, 0, 0, int(alpha * 0.4))
-    for offset_x, offset_y, size in [(2,2,4), (0,4,8)]:
-        for sw in range(size, 0, -2):
-            d.text((pad+offset_x, pad+offset_y), text, font=font, fill=shadow_col, stroke_width=sw, stroke_fill=shadow_col)
+    d.text((pad+2, pad+3), text, font=font, fill=shadow_col, stroke_width=4, stroke_fill=shadow_col)
             
     # Main text
     d.text((pad, pad), text, font=font, fill=(*color[:3], int(alpha)))
@@ -277,7 +291,12 @@ def draw_text_with_shadow(text, font, color, alpha=255, scale=1.0):
     if scale != 1.0:
         ns = (int(layer.width * scale), int(layer.height * scale))
         layer = layer.resize(ns, Image.Resampling.LANCZOS)
-    return layer, tw, th
+
+    result = (layer, tw, th)
+    # Cache limitado: evita crescer sem controle em músicas muito longas
+    if len(_WORD_LAYER_CACHE) < 4000:
+        _WORD_LAYER_CACHE[key] = result
+    return result
 
 def pre_render_background(style, w_res, h_res):
     """ Renderiza um fundo 15% maior para permitir a câmera virtual (parallax/zoom) """
@@ -298,10 +317,18 @@ def pre_render_background(style, w_res, h_res):
             draw.ellipse((x, y, x+size, y+size), fill=(255, 255, 255, int(rng.uniform(50, 180))))
     return bg
 
+from functools import lru_cache
+
+@lru_cache(maxsize=64)
+def _load_font(font_path, size):
+    # Sem isso, o TTF era reaberto e reparseado do disco em TODO frame (30x/segundo),
+    # mesmo quando o tamanho da fonte não muda dentro da mesma cena.
+    return ImageFont.truetype(font_path, size)
+
 def fit_wrapped(words, font_path, maxw, avail_h, base_size):
     """ Calcula a quebra de linha sem desenhar para alinhar text block """
     size = base_size
-    f = ImageFont.truetype(font_path, size)
+    f = _load_font(font_path, size)
     space = f.getlength(" ")
     
     rows = []; row = []; rw = 0
@@ -327,7 +354,11 @@ def render_frame(scene, style, reg, base_bg, local, t, total_dur):
     words = scene["words"]
     if not words: return bg_frame.convert("RGB")
     
-    blue_set = get_word_hierarchy(words)
+    # A hierarquia de destaque é a mesma em toda a duração da cena — calcular uma vez
+    # e guardar na própria cena evita refazer o loop de pontuação em todo frame.
+    if "_blue_set" not in scene:
+        scene["_blue_set"] = get_word_hierarchy(words)
+    blue_set = scene["_blue_set"]
     font_path = reg.get(style.font) or next(iter(reg.values()))
     
     # Escala mestre (Clímax ganha fonte maior)
@@ -404,12 +435,20 @@ def render_video(audio_path, scenes, reg, out_path, res, progress):
     # Pré-computa Direção (Clímax, Energia)
     apply_direction(scenes, end_time)
     
-    # Cache do background da cena para não gerar ruído aleatório por frame (preserva estabilidade do codec H264)
+    # Cache do background por ESTILO (cor de fundo + vfx), não por cena individual.
+    # Como só existem 3 "vibes" de cor x poucos vfx possíveis, isso trava o cache em
+    # no máximo ~9 imagens grandes (1.15x tela) — em vez de uma por cena, o que em
+    # músicas de 3-4 min (60-100+ cenas) podia sozinho passar de 500MB-1GB de RAM,
+    # estourando o limite do plano gratuito. Visualmente o resultado é o mesmo: cenas
+    # do mesmo vibe já pareciam idênticas (o ruído é sutil demais para notar).
     cached_bg = {}
     
     ff = ffmpeg(); silent = Path(out_path).with_name("silent.mp4")
+    # preset "veryfast" + crf 22: bem mais leve em CPU/RAM que medium+crf15 (que é
+    # quase lossless). O TikTok recomprime tudo no upload, então a diferença de
+    # qualidade percebida é mínima — mas o tempo/memória de encode cai bastante.
     cmd = [ff, "-y", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{ww}x{hh}", "-r", str(FPS), "-i", "-",
-           "-an", "-c:v", "libx264", "-preset", "medium", "-crf", "15", "-pix_fmt", "yuv420p", "-profile:v", "high",
+           "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-pix_fmt", "yuv420p", "-profile:v", "high",
            "-movflags", "+faststart", str(silent)]
            
     p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -422,11 +461,12 @@ def render_video(audio_path, scenes, reg, out_path, res, progress):
             scene = scenes[si]
             
             style = style_for(scene, si, reg)
-            if si not in cached_bg:
-                cached_bg[si] = pre_render_background(style, W, H)
+            bg_key = (style.bg, style.vfx)
+            if bg_key not in cached_bg:
+                cached_bg[bg_key] = pre_render_background(style, W, H)
                 
             local = clamp(t - scene["start"], 0, scene["end"] - scene["start"])
-            frame = np.asarray(render_frame(scene, style, reg, cached_bg[si], local, t, end_time), np.uint8)
+            frame = np.asarray(render_frame(scene, style, reg, cached_bg[bg_key], local, t, end_time), np.uint8)
             
             p.stdin.write(frame.tobytes())
             if progress and fi % (FPS*2) == 0: progress.progress(min(.95, fi / total_frames), text=f"Editando IA: {int(fi/total_frames*100)}%")
@@ -451,6 +491,19 @@ st.caption(f"Motor de Direção Automática de Retenção · {APP_VERSION}")
 audio = st.file_uploader("🎵 Música (MP3, WAV, M4A)", type=["mp3", "wav", "m4a", "mp4"])
 lyrics = st.text_area("📝 Letra de Referência (Opcional)", height=150, placeholder="Cole a letra para precisão perfeita. O sistema irá decupar a intenção musical automaticamente.")
 res_opt = st.selectbox("Formato", ["TikTok / Reels (1080×1920)"], index=0)
+whisper_model = st.selectbox(
+    "🎙️ Precisão da transcrição",
+    ["small (recomendado no plano gratuito)", "base (mais leve, menos preciso)", "medium (só se tiver RAM sobrando)"],
+    index=0,
+    help="No plano gratuito do Streamlit (≈1GB RAM), o modelo 'large-v3-turbo' costuma "
+         "estourar a memória sozinho. 'small' é o melhor equilíbrio entre precisão e "
+         "consumo; 'medium' pode falhar dependendo do tamanho da música."
+)
+WHISPER_MODEL_MAP = {
+    "small (recomendado no plano gratuito)": "small",
+    "base (mais leve, menos preciso)": "base",
+    "medium (só se tiver RAM sobrando)": "medium",
+}
 reg = fonts()
 
 if st.button("🚀 INICIAR DIREÇÃO AUTOMÁTICA", type="primary", use_container_width=True):
@@ -461,7 +514,7 @@ if st.button("🚀 INICIAR DIREÇÃO AUTOMÁTICA", type="primary", use_container
         ap = tmp / safe(audio.name); ap.write_bytes(audio.getbuffer())
         
         # Reconhecimento e Decupagem
-        asr, lang = transcribe(str(ap), "large-v3-turbo", status)
+        asr, lang = transcribe(str(ap), WHISPER_MODEL_MAP[whisper_model], status)
         if not asr: raise RuntimeError("Voz não detectada.")
         
         status.write("🧩 Direção de Arte em processamento...")
@@ -483,4 +536,3 @@ if st.button("🚀 INICIAR DIREÇÃO AUTOMÁTICA", type="primary", use_container
     except Exception as e:
         st.error("Erro na Edição Automática.")
         st.code(str(e))
-
