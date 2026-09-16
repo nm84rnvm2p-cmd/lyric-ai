@@ -1,13 +1,3 @@
-Esse erro aconteceu por um "choque de realidade" entre o que você colou na caixa de texto e o que a IA (Whisper) ouviu no áudio.
-Existem dois motivos principais para esse erro ter estourado:
- * Você colou a letra com os "tempos" antigos (ex: 00:12.30 | palavra), e como a IA tenta alinhar palavra por palavra, ela tentou procurar o som de "zero zero doze trinta" na música, não encontrou, e abortou a edição.
- * A música tem um instrumental longo / ruído alto, e o Whisper não conseguiu escutar exatamente as palavras que você colou, fazendo o sistema de alinhamento devolver um resultado vazio.
-🛠️ O que eu alterei na Lógica (A Solução):
-Para que seu código não seja frágil e pare de travar, adicionei 3 Camadas de Segurança (Failsafes):
- * Auto-Cleaner de Letras: Agora você pode colar a letra suja, com ou sem tempos (timestamps). A IA vai ler, apagar os números invisivelmente e usar só as palavras.
- * Janela de Busca Expandida: Aumentei a memória de busca da IA. Se a música tiver um solo de guitarra de 1 minuto, ela não desiste do alinhamento, ela varre o áudio mais pra frente.
- * Auto-Fallback (O mais importante): Se a letra que você colou for impossível de ser alinhada com a voz (ou a música for muito barulhenta), o código não vai mais dar erro e parar. Ele vai ignorar a letra que você colou e vai usar automaticamente o que a própria IA escutou, renderizando o vídeo normalmente.
-Aqui está o seu app.py corrigido e blindado contra erros. Pode copiar e substituir tudo:
 # -*- coding: utf-8 -*-
 import os, re, math, shutil, subprocess, tempfile, urllib.request, difflib, unicodedata
 from pathlib import Path
@@ -484,4 +474,3 @@ if st.button("🚀 INICIAR DIREÇÃO AUTOMÁTICA", type="primary", use_container
         st.download_button("⬇️ Baixar MP4 (Pronto para TikTok)", out.read_bytes(), "lyric_viral_final.mp4", "video/mp4", use_container_width=True)
     except Exception as e:
         st.error(f"Erro na Edição Automática: {str(e)}")
-
